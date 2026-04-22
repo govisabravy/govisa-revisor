@@ -331,17 +331,21 @@ export function getUserRanking(period: Period = "30d", dimension: Dimension = "o
     };
   });
 
-  // Rank by dimension
+  // Rank by dimension — users sem atividade no período vão pro fim
   const scoreFn = (s: UserScore): number => {
+    if (s.volume.reviews === 0) return -Infinity;
     if (dimension === "volume") return s.volume.reviews;
-    if (dimension === "quality") return -s.quality.critical_pct; // menos crítico = melhor
-    if (dimension === "efficiency") return -s.efficiency.avg_elapsed_ms; // mais rápido = melhor
-    if (dimension === "reliability") return -s.reliability.error_rate; // menos erro = melhor
-    // overall = normalizado soma de cada dim
-    return s.volume.reviews - s.quality.critical_pct - s.efficiency.avg_elapsed_ms/10000 - s.reliability.error_rate*100;
+    if (dimension === "quality") return -s.quality.critical_pct;
+    if (dimension === "efficiency") return -s.efficiency.avg_elapsed_ms;
+    if (dimension === "reliability") return -s.reliability.error_rate;
+    return s.volume.reviews - s.quality.critical_pct - s.efficiency.avg_elapsed_ms / 10000 - s.reliability.error_rate * 100;
   };
-  results.sort((a, b) => scoreFn(b) - scoreFn(a));
-  results.forEach((r, i) => r.rank = i + 1);
+  results.sort((a, b) => {
+    const sa = scoreFn(a), sb = scoreFn(b);
+    if (sa === -Infinity && sb === -Infinity) return (a.email || "").localeCompare(b.email || "");
+    return sb - sa;
+  });
+  results.forEach((r, i) => (r.rank = i + 1));
   return results;
 }
 
