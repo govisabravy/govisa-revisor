@@ -3,9 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev -p 3031",
+    "dev": "bash -c 'source scripts/load-env.sh && next dev -p 3031'",
     "build": "next build",
-    "start": "next start -p 3031",
+    "start": "bash -c 'source scripts/load-env.sh && next start -p 3031'",
     "lint": "next lint",
     "typecheck": "tsc --noEmit"
   },
