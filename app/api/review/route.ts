@@ -7,7 +7,7 @@ import { logEvent } from "@/lib/logger";
 import { getCurrentUser } from "@/lib/auth/current-user";
 
 export const runtime = "nodejs";
-export const maxDuration = 300;
+export const maxDuration = 500;
 
 export async function POST(req: NextRequest) {
   const user = await getCurrentUser();
