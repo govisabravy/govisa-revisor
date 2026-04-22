@@ -5,18 +5,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   python3 make g++ poppler-utils ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
-# --------- deps stage (npm ci com lockfile) ---------
+# --------- deps stage (npm ci com lockfile — inclui dev deps pro build) ---------
 FROM base AS deps
 WORKDIR /app
+ENV NODE_ENV=development
 COPY package.json package-lock.json ./
-RUN npm ci
+RUN npm ci --include=dev
 
 # --------- builder stage (compila Next.js standalone) ---------
 FROM base AS builder
 WORKDIR /app
+ENV NODE_ENV=development
+ENV NEXT_TELEMETRY_DISABLED=1
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 
 # --------- runner stage (imagem final) ---------
