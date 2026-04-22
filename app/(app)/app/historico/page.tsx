@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { Clock, AlertTriangle, DollarSign, FileText, ArrowLeft } from "lucide-react";
+import { Clock, AlertTriangle, DollarSign, FileText } from "lucide-react";
 
 interface Row {
   id: string;
@@ -29,23 +29,8 @@ export default function HistoricoPage() {
 
   return (
     <main className="min-h-screen bg-slate-50">
-      <header className="bg-govisa-navy text-white py-5 px-6">
-        <div className="max-w-5xl mx-auto flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <Clock className="w-6 h-6" />
-            <h1 className="text-xl font-bold">Histórico de Revisões</h1>
-          </div>
-          <Link
-            href="/"
-            className="flex items-center gap-2 px-4 py-2 bg-white/10 hover:bg-white/20 rounded-lg text-sm"
-          >
-            <ArrowLeft className="w-4 h-4" />
-            Nova revisão
-          </Link>
-        </div>
-      </header>
-
-      <div className="max-w-5xl mx-auto p-6">
+      <div className="max-w-5xl mx-auto p-6 space-y-4">
+        <h1 className="text-2xl font-bold text-slate-900">Histórico de Revisões</h1>
         {loading ? (
           <div className="text-center text-slate-500 py-12">Carregando...</div>
         ) : rows.length === 0 ? (
@@ -55,7 +40,7 @@ export default function HistoricoPage() {
             {rows.map((r) => (
               <Link
                 key={r.id}
-                href={`/historico/${r.id}`}
+                href={`/app/historico/${r.id}`}
                 className="block bg-white rounded-2xl p-5 border border-slate-200 hover:border-govisa-navy transition"
               >
                 <div className="flex items-center justify-between">

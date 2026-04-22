@@ -1,7 +1,8 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  output: "standalone",
   experimental: {
-    serverComponentsExternalPackages: ["pdf-parse"]
+    serverComponentsExternalPackages: ["pdf-parse", "better-sqlite3"]
   }
 };
 

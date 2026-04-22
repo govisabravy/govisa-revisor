@@ -27,12 +27,14 @@ export default function UploadDropzone({ onFile, disabled }: Props) {
   return (
     <div
       {...getRootProps()}
-      className={`flex flex-col items-center justify-center border-2 border-dashed rounded-2xl p-12 text-center cursor-pointer transition ${
+      className={`flex flex-col items-center justify-center border-2 border-dashed rounded-2xl p-14 text-center cursor-pointer transition hover:border-slate-400 hover:scale-[1.01] ${
         isDragActive ? "border-govisa-navy bg-blue-50" : "border-slate-300 bg-white"
       } ${disabled ? "opacity-50 pointer-events-none" : ""}`}
     >
       <input {...getInputProps()} />
-      <UploadCloud className="w-12 h-12 text-govisa-navy mb-3" />
+      <div className="bg-slate-100 rounded-full p-3 mb-3">
+        <UploadCloud className="w-12 h-12 text-govisa-navy" />
+      </div>
       <p className="text-lg font-semibold text-slate-800">
         {isDragActive ? "Solte o PDF aqui" : "Arraste o processo em PDF ou clique para selecionar"}
       </p>

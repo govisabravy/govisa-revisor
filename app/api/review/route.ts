@@ -4,15 +4,19 @@ import { reviewProcess } from "@/lib/reviewer";
 import { saveReview, saveUsageEvents } from "@/lib/db";
 import { estimateCostUSD } from "@/lib/pricing";
 import { logEvent } from "@/lib/logger";
+import { getCurrentUser } from "@/lib/auth/current-user";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
 
 export async function POST(req: NextRequest) {
+  const user = await getCurrentUser();
+  if (!user) return NextResponse.json({ error: "Não autenticado" }, { status: 401 });
+
   const reviewId = uuid();
   const startedAt = new Date().toISOString();
 
-  logEvent({ level: "info", msg: "review.start", review_id: reviewId });
+  logEvent({ level: "info", msg: "review.start", review_id: reviewId, user_id: user.id });
 
   try {
     const formData = await req.formData();
@@ -26,7 +30,11 @@ export async function POST(req: NextRequest) {
     const modeRaw = String(formData.get("mode") ?? "draft").toLowerCase();
     const mode: "draft" | "final" = modeRaw === "final" ? "final" : "draft";
 
-    const result = await reviewProcess({ buffer, mode });
+    const caseTypeRaw = String(formData.get("case_type") ?? "t_visa").toLowerCase();
+    const caseType: "t_visa" | "vawa" | "u_visa" =
+      caseTypeRaw === "vawa" ? "vawa" : caseTypeRaw === "u_visa" ? "u_visa" : "t_visa";
+
+    const result = await reviewProcess({ buffer, mode, caseType });
 
     const usageTotals = {
       input_tokens: 0,
@@ -67,7 +75,9 @@ export async function POST(req: NextRequest) {
       total_cache_read_tokens: usageTotals.cache_read_input_tokens,
       estimated_cost_usd: costUsd,
       report_json: JSON.stringify(result.report),
-      debug_json: JSON.stringify(result.debug)
+      debug_json: JSON.stringify(result.debug),
+      user_id: user.id,
+      case_type: caseType
     });
 
     saveUsageEvents(

@@ -9,6 +9,11 @@ export type DocKind =
   | "I-192"
   | "I-765"
   | "G-28"
+  | "I-360"
+  | "I-485"
+  | "I-918"
+  | "I-918A"
+  | "I-918B"
   | "identification"
   | "country_conditions"
   | "witness_statements"
@@ -170,32 +175,44 @@ async function callJsonWithDocument<T>(opts: {
   }
 }
 
-const STRUCTURE_SYSTEM = `Você é um especialista em processos USCIS de visto T (vítima de tráfico humano) montados pela Go Visa Law Firm.
+const STRUCTURE_SYSTEM = `Você é um especialista em processos USCIS de imigração humanitária (T-visa, U-visa, VAWA) montados pela Go Visa Law Firm.
 
 Sua tarefa: dado um índice numerado com o início de cada página de um processo compilado, determinar o RANGE DE PÁGINAS de cada documento interno.
 
-Documentos esperados (os que estiverem presentes):
-- cover_letter: carta de apresentação do advogado
-- I-914: formulário principal (Application for T Nonimmigrant Status)
-- I-914A: Supplement A — Application for Family Member of T-1 Recipient (um por familiar)
-- I-914B: Supplement B — Declaration of Law Enforcement Officer
-- I-192: Application for Advance Permission to Enter as Nonimmigrant
-- I-765: Application for Employment Authorization
-- G-28: Notice of Entry of Appearance as Attorney (pode haver múltiplos, um por requerente)
-- identification: cópias de passaporte, documentos de ID
-- country_conditions: material sobre condições do país de origem
-- witness_statements: declarações de testemunhas, declarações juramentadas
+Documentos esperados (liste só os presentes):
+T-visa:
+- I-914: principal (Application for T Nonimmigrant Status)
+- I-914A: Supplement A (Family Member of T-1)
+- I-914B: Supplement B (Declaration of Law Enforcement Officer)
+VAWA:
+- I-360: Self-Petition (VAWA Self-Petition)
+- I-485: Application to Register Permanent Residence (quando vem junto)
+U-visa:
+- I-918: principal (Petition for U Nonimmigrant Status)
+- I-918A: Supplement A (Qualifying Family Member)
+- I-918B: Supplement B (U Nonimmigrant Status Certification, assinado por LEA)
+Comuns:
+- cover_letter: carta do advogado
+- I-192: Advance Permission to Enter as Nonimmigrant (waiver de inadmissibilidade)
+- I-765: Employment Authorization
+- G-28: Notice of Entry of Appearance as Attorney
+- identification: passaporte, RG, docs de ID
+- country_conditions: material sobre condições do país de origem (pode não existir em VAWA/U)
+- witness_statements: declarações de testemunhas
 - medical_records: registros médicos e psicológicos
-- story: Declaration of <nome> / Personal Statement / Applicant's Statement (história escrita do cliente em primeira pessoa)
+- story: Declaration of <nome> / Personal Statement (narrativa em primeira pessoa)
 - final: final considerations
-- other: qualquer coisa que não se encaixe
+- other: não se encaixa
 
 REGRAS CRÍTICAS:
-- Ignore a Table of Contents (primeiras páginas); mapeie somente os documentos reais.
-- O I-914A tem no rodapé "Form I-914 Supplement A" e começa com "Application for Family Member of T-1 Recipient". NÃO o confunda com I-914.
-- O I-914B tem no rodapé "Form I-914 Supplement B" e começa com "Declaration of Law Enforcement Officer". NÃO o confunda com I-914.
-- Cada form USCIS tem rodapé "Page N of M" — use isso pra saber quando um form termina.
-- A "story" (Declaration of <nome>) é uma narrativa em primeira pessoa do cliente, geralmente 2-20 páginas, NÃO é um formulário USCIS.
+- Ignore a Table of Contents (primeiras páginas com índice numerado de itens); mapeie somente os documentos reais.
+- I-914A rodapé "Form I-914 Supplement A" — NÃO confunda com I-914.
+- I-914B rodapé "Form I-914 Supplement B" — NÃO confunda com I-914.
+- I-918A rodapé "Form I-918 Supplement A" — NÃO confunda com I-918.
+- I-918B rodapé "Form I-918 Supplement B" — NÃO confunda com I-918.
+- Cada form USCIS tem "Page N of M" no rodapé — use pra saber onde um form termina.
+- A "story" é narrativa do peticionário (em T-visa é declaração de vítima de tráfico, em VAWA é declaração sobre casamento/abuso, em U-visa é declaração sobre o crime e abuso). Não confunda com witness_statements.
+- Cover letter no início do processo frequentemente traz narrativa do caso — se houver Personal Statement / Declaration separada, essa é a story; caso contrário, o cover_letter pode servir como story.
 - Devolva SOMENTE JSON válido.`;
 
 export async function mapDocumentStructure(pageHeads: string[]): Promise<DocumentStructure | null> {

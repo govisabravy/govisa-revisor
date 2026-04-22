@@ -4,9 +4,14 @@ import { mkdirSync } from "fs";
 
 const dbDir = path.join(process.cwd(), "data");
 mkdirSync(dbDir, { recursive: true });
-const dbPath = path.join(dbDir, "govisa-revisor.db");
+const dbPath = path.join(dbDir, process.env.AUTH_DB_PATH ?? "govisa-revisor.db");
 
 let db: Database.Database | null = null;
+
+function hasColumn(d: Database.Database, table: string, col: string): boolean {
+  const rows = d.prepare(`PRAGMA table_info(${table})`).all() as any[];
+  return rows.some((r) => r.name === col);
+}
 
 function getDb(): Database.Database {
   if (db) return db;
@@ -61,7 +66,42 @@ function getDb(): Database.Database {
 
     CREATE INDEX IF NOT EXISTS idx_reviews_created_at ON reviews(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_usage_review ON usage_events(review_id);
+
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      email TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      name TEXT,
+      role TEXT NOT NULL CHECK(role IN ('admin','user')),
+      must_change_password INTEGER NOT NULL DEFAULT 1,
+      active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      last_login_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      user_agent TEXT,
+      ip TEXT,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
   `);
+
+  if (!hasColumn(db, "reviews", "user_id")) {
+    db.exec(`ALTER TABLE reviews ADD COLUMN user_id TEXT`);
+  }
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_reviews_user ON reviews(user_id, created_at DESC)`);
+
+  if (!hasColumn(db, "reviews", "case_type")) {
+    db.exec(`ALTER TABLE reviews ADD COLUMN case_type TEXT`);
+  }
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_reviews_case_type ON reviews(case_type)`);
 
   return db;
 }
@@ -90,6 +130,8 @@ export interface ReviewRecord {
   estimated_cost_usd: number;
   report_json: string;
   debug_json: string;
+  user_id?: string | null;
+  case_type?: string | null;
 }
 
 export interface UsageEventRecord {
@@ -107,6 +149,19 @@ export interface UsageEventRecord {
   error?: string;
 }
 
+export interface UserRecord {
+  id: string;
+  email: string;
+  password_hash: string;
+  name: string | null;
+  role: "admin" | "user";
+  must_change_password: number;
+  active: number;
+  created_at: string;
+  updated_at: string;
+  last_login_at: string | null;
+}
+
 export function saveReview(record: ReviewRecord): void {
   const d = getDb();
   const stmt = d.prepare(
@@ -114,15 +169,17 @@ export function saveReview(record: ReviewRecord): void {
       total_findings, critical_count, high_count, medium_count, low_count,
       tier1_count, tier2_count, tier3_count,
       elapsed_ms, total_input_tokens, total_output_tokens, total_cache_creation_tokens, total_cache_read_tokens,
-      estimated_cost_usd, report_json, debug_json)
+      estimated_cost_usd, report_json, debug_json, user_id, case_type)
      VALUES (@id, @created_at, @file_name, @file_size, @num_pages, @client_name, @forms_detected,
       @total_findings, @critical_count, @high_count, @medium_count, @low_count,
       @tier1_count, @tier2_count, @tier3_count,
       @elapsed_ms, @total_input_tokens, @total_output_tokens, @total_cache_creation_tokens, @total_cache_read_tokens,
-      @estimated_cost_usd, @report_json, @debug_json)`
+      @estimated_cost_usd, @report_json, @debug_json, @user_id, @case_type)`
   );
   stmt.run({
     ...record,
+    user_id: record.user_id ?? null,
+    case_type: record.case_type ?? null,
     forms_detected: JSON.stringify(record.forms_detected)
   });
 }
@@ -160,7 +217,7 @@ export function saveUsageEvents(events: UsageEventRecord[]): void {
   tx(events);
 }
 
-export function listReviews(limit = 50): Array<{
+export function listReviews(opts: { userId?: string | null; limit?: number } = {}): Array<{
   id: string;
   created_at: string;
   file_name: string;
@@ -170,19 +227,32 @@ export function listReviews(limit = 50): Array<{
   high_count: number;
   elapsed_ms: number;
   estimated_cost_usd: number;
+  user_id: string | null;
+  case_type: string | null;
 }> {
   const d = getDb();
-  const rows = d
-    .prepare(
-      `SELECT id, created_at, file_name, client_name, total_findings, critical_count, high_count,
-              elapsed_ms, estimated_cost_usd
-       FROM reviews ORDER BY created_at DESC LIMIT ?`
-    )
-    .all(limit) as any[];
+  const limit = opts.limit ?? 50;
+  const rows = opts.userId
+    ? (d
+        .prepare(
+          `SELECT id, created_at, file_name, client_name, total_findings, critical_count, high_count,
+                  elapsed_ms, estimated_cost_usd, user_id, case_type
+           FROM reviews WHERE user_id = ? ORDER BY created_at DESC LIMIT ?`
+        )
+        .all(opts.userId, limit) as any[])
+    : (d
+        .prepare(
+          `SELECT id, created_at, file_name, client_name, total_findings, critical_count, high_count,
+                  elapsed_ms, estimated_cost_usd, user_id, case_type
+           FROM reviews ORDER BY created_at DESC LIMIT ?`
+        )
+        .all(limit) as any[]);
   return rows;
 }
 
-export function getReview(id: string): { report: any; debug: any; meta: any } | null {
+export function getReview(
+  id: string
+): { report: any; debug: any; meta: any } | null {
   const d = getDb();
   const row = d.prepare(`SELECT * FROM reviews WHERE id = ?`).get(id) as any;
   if (!row) return null;
@@ -198,4 +268,91 @@ export function getReview(id: string): { report: any; debug: any; meta: any } | 
       usage_events: events
     }
   };
+}
+
+export function createUser(input: {
+  id: string;
+  email: string;
+  password_hash: string;
+  name: string | null;
+  role: "admin" | "user";
+  must_change_password?: boolean;
+}): void {
+  const d = getDb();
+  const now = new Date().toISOString();
+  d.prepare(
+    `INSERT INTO users (id, email, password_hash, name, role, must_change_password, active, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`
+  ).run(
+    input.id,
+    input.email.toLowerCase().trim(),
+    input.password_hash,
+    input.name,
+    input.role,
+    input.must_change_password === false ? 0 : 1,
+    now,
+    now
+  );
+}
+
+export function getUserByEmail(email: string): UserRecord | null {
+  const d = getDb();
+  const row = d
+    .prepare(`SELECT * FROM users WHERE email = ? AND active = 1`)
+    .get(email.toLowerCase().trim()) as any;
+  return row ?? null;
+}
+
+export function getUserById(id: string): UserRecord | null {
+  const d = getDb();
+  const row = d.prepare(`SELECT * FROM users WHERE id = ?`).get(id) as any;
+  return row ?? null;
+}
+
+export function listUsers(): UserRecord[] {
+  const d = getDb();
+  return d.prepare(`SELECT * FROM users ORDER BY created_at DESC`).all() as any[];
+}
+
+export function updateUser(
+  id: string,
+  patch: Partial<{
+    name: string | null;
+    role: "admin" | "user";
+    active: number;
+    must_change_password: number;
+    password_hash: string;
+    last_login_at: string;
+  }>
+): void {
+  const d = getDb();
+  const fields: string[] = [];
+  const values: any[] = [];
+  for (const [k, v] of Object.entries(patch)) {
+    fields.push(`${k} = ?`);
+    values.push(v);
+  }
+  if (fields.length === 0) return;
+  fields.push(`updated_at = ?`);
+  values.push(new Date().toISOString());
+  values.push(id);
+  d.prepare(`UPDATE users SET ${fields.join(", ")} WHERE id = ?`).run(...values);
+}
+
+export function deleteUser(id: string): void {
+  const d = getDb();
+  d.prepare(`UPDATE users SET active = 0, updated_at = ? WHERE id = ?`).run(
+    new Date().toISOString(),
+    id
+  );
+}
+
+export function countUsers(): number {
+  const d = getDb();
+  const r = d.prepare(`SELECT COUNT(*) as c FROM users WHERE active = 1`).get() as any;
+  return r.c ?? 0;
+}
+
+export function getDatabase(): Database.Database {
+  return getDb();
 }

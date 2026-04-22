@@ -25,20 +25,17 @@ export default function HistoricoDetailPage() {
 
   return (
     <main className="min-h-screen bg-slate-50">
-      <header className="bg-govisa-navy text-white py-5 px-6">
-        <div className="max-w-5xl mx-auto flex items-center justify-between">
-          <h1 className="text-xl font-bold">{meta.client_name ?? meta.file_name}</h1>
+      <div className="max-w-5xl mx-auto p-6 space-y-6">
+        <div className="flex items-center justify-between">
+          <h1 className="text-2xl font-bold text-slate-900">{meta.client_name ?? meta.file_name}</h1>
           <Link
-            href="/historico"
-            className="flex items-center gap-2 px-4 py-2 bg-white/10 hover:bg-white/20 rounded-lg text-sm"
+            href="/app/historico"
+            className="flex items-center gap-2 px-4 py-2 bg-white border border-slate-200 rounded-lg text-sm hover:bg-slate-50"
           >
             <ArrowLeft className="w-4 h-4" />
             Voltar
           </Link>
         </div>
-      </header>
-
-      <div className="max-w-5xl mx-auto p-6 space-y-6">
         <div className="bg-white rounded-2xl p-5 border border-slate-200">
           <div className="grid grid-cols-4 gap-4 text-sm">
             <MetaItem icon={<Hash className="w-4 h-4" />} label="Review ID" value={meta.id.slice(0, 8)} />
