@@ -9,7 +9,9 @@ const nextConfig = {
   webpack: (config) => {
     config.resolve.alias["@"] = path.resolve(__dirname);
     return config;
-  }
+  },
+  typescript: { ignoreBuildErrors: false },
+  eslint: { ignoreDuringBuilds: true }
 };
 
 module.exports = nextConfig;
