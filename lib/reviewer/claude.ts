@@ -104,6 +104,18 @@ export function onUsage(listener: (e: UsageEvent) => void) {
   return () => usageListeners.delete(listener);
 }
 
+// Canal publico de emissao. Usado por modulos como senior.ts e cluster-validator.ts
+// que fazem chamadas diretas ao SDK (sem passar por callJsonWithDocument /
+// callToolWithDocument) e precisam reportar telemetria no MESMO set de listeners
+// que reviewProcess assina, garantindo que cada evento chegue em usage_events.
+export function emitUsage(event: UsageEvent) {
+  for (const l of usageListeners) {
+    try {
+      l(event);
+    } catch {}
+  }
+}
+
 export async function callJsonWithDocument<T>(opts: {
   systemBlocks: Array<{ type: "text"; text: string; cacheControl?: boolean }>;
   pdfBase64?: string;

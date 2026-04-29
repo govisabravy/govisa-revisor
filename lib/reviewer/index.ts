@@ -777,10 +777,22 @@ export async function reviewProcess(input: ReviewInput): Promise<ReviewOutput> {
       mode: input.mode ?? "draft"
     });
   } catch (err) {
-    console.error(
-      "Senior cross-check falhou (degradando):",
-      String((err as any)?.message ?? err).slice(0, 200)
-    );
+    const errMsg = String((err as any)?.message ?? err).slice(0, 200);
+    console.error("Senior cross-check falhou (degradando):", errMsg);
+    // Garante que a falha externa fique gravada em usage_events para alerta.
+    usageEvents.push({
+      operation: "seniorCrossCheck",
+      model: process.env.ANTHROPIC_MODEL ?? "claude-opus-4-7",
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      duration_ms: 0,
+      attempts: 0,
+      had_pdf: false,
+      ok: false,
+      error: `outer catch: ${errMsg}`
+    });
     seniorFindings = [];
   }
   findings = findings.concat(seniorFindings);
@@ -834,10 +846,21 @@ export async function reviewProcess(input: ReviewInput): Promise<ReviewOutput> {
       findings = applyAdversarialDecisions(findings, adversarial.decisions);
     }
   } catch (err) {
-    console.error(
-      "Adversarial Pass falhou (degradando):",
-      String((err as any)?.message ?? err).slice(0, 200)
-    );
+    const errMsg = String((err as any)?.message ?? err).slice(0, 200);
+    console.error("Adversarial Pass falhou (degradando):", errMsg);
+    usageEvents.push({
+      operation: "adversarialReview",
+      model: process.env.ANTHROPIC_MODEL ?? "claude-opus-4-7",
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      duration_ms: 0,
+      attempts: 0,
+      had_pdf: false,
+      ok: false,
+      error: `outer catch: ${errMsg}`
+    });
   }
 
   // ---------------------------------------------------------------------------

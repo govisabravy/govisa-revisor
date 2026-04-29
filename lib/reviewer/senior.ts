@@ -20,30 +20,133 @@ import type {
   UVisaStoryFacts
 } from "../schemas/uvisa";
 import type { PassportSignatureCheck, UsageEvent } from "./claude";
-import { onUsage } from "./claude";
+import { onUsage, emitUsage } from "./claude";
 
 // Senior pass é best-effort. Pode ser desabilitado por env.
 const SENIOR_PASS_ENABLED = process.env.REVIEWER_SENIOR_PASS !== "off";
 
 const MODEL = process.env.ANTHROPIC_MODEL ?? "claude-opus-4-7";
 
-// Internal usage emitter — replica padrão de claude.ts (que mantém um Set de listeners interno).
-// Como onUsage é exportada e adiciona listener, aqui precisamos emitir via o mesmo set.
-// Solução simples: importamos onUsage só pra manter compat, mas usamos nosso próprio listener-set
-// para emit. Como o set em claude.ts é privado, usamos um channel separado: registrar listeners aqui
-// também emitiria — mas o pipeline principal só escuta os emitidos em claude.ts.
-// Para compatibilidade total com o pipeline existente, fazemos o seguinte: criamos um listener
-// interno que repassa eventos do nosso emitter para qualquer listener do claude.ts. NÃO é trivial
-// sem reflection. Para esta versão, emitimos apenas no nosso próprio emitter local — quem quiser
-// telemetria do senior pass usa onSeniorUsage exportado abaixo. TODO: unificar telemetria com claude.ts.
-const seniorUsageListeners = new Set<(e: UsageEvent) => void>();
+// Compat: alguns consumidores legados podem usar onSeniorUsage. Mantemos a API
+// pública, mas agora ela apenas delega ao canal unificado em claude.ts. Todos
+// os eventos do senior pass agora são emitidos via emitUsage() do claude.ts,
+// garantindo que cheguem ao listener central registrado em reviewProcess e,
+// portanto, sejam persistidos em usage_events.
 export function onSeniorUsage(listener: (e: UsageEvent) => void) {
-  seniorUsageListeners.add(listener);
-  return () => seniorUsageListeners.delete(listener);
+  return onUsage(listener);
 }
-// Mantém referência pra evitar warning de import unused (onUsage usado por consumidores externos
-// que escutam eventos de claude.ts). Não chamamos aqui.
-void onUsage;
+
+// =============================================================================
+// Helpers de diagnóstico de response Opus
+// =============================================================================
+//
+// Quando o Opus 4.7 roda com `thinking: { type: "adaptive" }`, ocasionalmente
+// devolve um content array contendo APENAS bloco `thinking` (sem `text` nem
+// `tool_use`). Antes esse caso virava `[]` silencioso. Agora distinguimos:
+// se tinha bloco de thinking, registramos como falha real com diagnóstico
+// rico, e o caller pode optar por retentar sem thinking.
+
+interface ResponseDiagnostic {
+  has_text: boolean;
+  has_tool_use: boolean;
+  has_thinking: boolean;
+  content_types: string[];
+  stop_reason: string | null;
+  output_tokens: number;
+  text_preview: string | null;
+}
+
+function diagnoseResponse(res: any, toolName?: string): ResponseDiagnostic {
+  const content: any[] = res?.content ?? [];
+  const types: string[] = content.map((b: any) => b?.type ?? "unknown");
+  const textBlock = content.find((b: any) => b?.type === "text");
+  const toolBlock = toolName
+    ? content.find((b: any) => b?.type === "tool_use" && b?.name === toolName)
+    : content.find((b: any) => b?.type === "tool_use");
+  const text =
+    textBlock && typeof textBlock.text === "string" ? textBlock.text : null;
+  return {
+    has_text: !!textBlock && typeof textBlock?.text === "string",
+    has_tool_use: !!toolBlock,
+    has_thinking: types.includes("thinking"),
+    content_types: types,
+    stop_reason: res?.stop_reason ?? null,
+    output_tokens: res?.usage?.output_tokens ?? 0,
+    text_preview: text ? text.slice(0, 500) : null
+  };
+}
+
+function diagnosticToErrorMsg(d: ResponseDiagnostic, prefix: string): string {
+  const parts = [
+    prefix,
+    `stop_reason=${d.stop_reason ?? "unknown"}`,
+    `content_types=[${d.content_types.join(",")}]`,
+    `output_tokens=${d.output_tokens}`,
+    `has_text=${d.has_text}`,
+    `has_tool_use=${d.has_tool_use}`,
+    `has_thinking=${d.has_thinking}`
+  ];
+  if (d.text_preview) {
+    parts.push(`text_preview=${JSON.stringify(d.text_preview)}`);
+  }
+  return parts.join(" | ").slice(0, 1500);
+}
+
+function buildSeniorUsageEvent(args: {
+  res: any;
+  startedAt: number;
+  attempts: number;
+  caughtErr: any;
+  errorOverride?: string;
+}): UsageEvent {
+  const { res, startedAt, attempts, caughtErr, errorOverride } = args;
+  const errStr = errorOverride
+    ? errorOverride
+    : caughtErr
+      ? String(caughtErr?.message ?? caughtErr).slice(0, 1500)
+      : undefined;
+  return {
+    operation: "seniorCrossCheck",
+    model: MODEL,
+    input_tokens: res?.usage?.input_tokens ?? 0,
+    output_tokens: res?.usage?.output_tokens ?? 0,
+    cache_creation_input_tokens: res?.usage?.cache_creation_input_tokens ?? 0,
+    cache_read_input_tokens: res?.usage?.cache_read_input_tokens ?? 0,
+    duration_ms: Date.now() - startedAt,
+    attempts,
+    had_pdf: false,
+    ok: !caughtErr && !errorOverride,
+    error: errStr
+  };
+}
+
+function buildAdversarialUsageEvent(args: {
+  res: any;
+  startedAt: number;
+  attempts: number;
+  caughtErr: any;
+  errorOverride?: string;
+}): UsageEvent {
+  const { res, startedAt, attempts, caughtErr, errorOverride } = args;
+  const errStr = errorOverride
+    ? errorOverride
+    : caughtErr
+      ? String(caughtErr?.message ?? caughtErr).slice(0, 1500)
+      : undefined;
+  return {
+    operation: "adversarialReview",
+    model: MODEL,
+    input_tokens: res?.usage?.input_tokens ?? 0,
+    output_tokens: res?.usage?.output_tokens ?? 0,
+    cache_creation_input_tokens: res?.usage?.cache_creation_input_tokens ?? 0,
+    cache_read_input_tokens: res?.usage?.cache_read_input_tokens ?? 0,
+    duration_ms: Date.now() - startedAt,
+    attempts,
+    had_pdf: false,
+    ok: !caughtErr && !errorOverride,
+    error: errStr
+  };
+}
 
 function getClient(): Anthropic {
   const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -315,28 +418,32 @@ function buildCaseSummary(input: SeniorInput): string {
   return lines.join("\n");
 }
 
-function emitUsage(event: UsageEvent) {
-  for (const l of seniorUsageListeners) {
-    try {
-      l(event);
-    } catch {}
-  }
-}
-
 export async function seniorCrossCheck(input: SeniorInput): Promise<Finding[]> {
   if (!SENIOR_PASS_ENABLED) {
     console.log("[seniorCrossCheck] disabled via REVIEWER_SENIOR_PASS=off");
     return [];
   }
 
+  const startedTotal = Date.now();
   let client: Anthropic;
   try {
     client = getClient();
   } catch (err: any) {
-    console.error(
-      "seniorCrossCheck failed:",
-      String(err?.message ?? err).slice(0, 200)
-    );
+    const errMsg = String(err?.message ?? err).slice(0, 200);
+    console.error("seniorCrossCheck failed:", errMsg);
+    emitUsage({
+      operation: "seniorCrossCheck",
+      model: MODEL,
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      duration_ms: Date.now() - startedTotal,
+      attempts: 0,
+      had_pdf: false,
+      ok: false,
+      error: `getClient: ${errMsg}`
+    });
     return [];
   }
 
@@ -368,92 +475,153 @@ Devolva SOMENTE JSON válido no formato:
 
 Máximo 8 findings. Não emita findings se não houver evidência clara nos dados acima.`;
 
-  const started = Date.now();
-  let attempts = 0;
-  let res: any;
-  let caughtErr: any;
-
-  try {
-    res = await callWithRetry(() => {
-      attempts++;
-      // SDK Anthropic 0.39 suporta extended thinking nativamente.
-      return client.messages.create({
-        model: MODEL,
-        max_tokens: 8192,
-        thinking: { type: "adaptive" } as any,
-        system: [
-          {
-            type: "text",
-            text: SENIOR_SYSTEM,
-            cache_control: { type: "ephemeral" }
-          } as any
-        ],
-        messages: [
-          {
-            role: "user",
-            content: [{ type: "text", text: userPrompt }]
-          }
-        ]
+  // Tentativa 1: extended thinking adaptive (raciocínio melhor para cross-check sutil).
+  // Se vier response sem text/tool_use (só thinking), retentamos 1x sem thinking.
+  async function callOnce(useThinking: boolean): Promise<{
+    res: any;
+    attempts: number;
+    startedAt: number;
+    caughtErr: any;
+  }> {
+    const startedAt = Date.now();
+    let attempts = 0;
+    let res: any;
+    let caughtErr: any;
+    try {
+      res = await callWithRetry(() => {
+        attempts++;
+        const params: any = {
+          model: MODEL,
+          max_tokens: useThinking ? 8192 : 12000,
+          system: [
+            {
+              type: "text",
+              text: SENIOR_SYSTEM,
+              cache_control: { type: "ephemeral" }
+            } as any
+          ],
+          messages: [
+            {
+              role: "user",
+              content: [{ type: "text", text: userPrompt }]
+            }
+          ]
+        };
+        if (useThinking) {
+          params.thinking = { type: "adaptive" } as any;
+        }
+        return client.messages.create(params);
       });
-    });
-  } catch (err) {
-    caughtErr = err;
+    } catch (err) {
+      caughtErr = err;
+    }
+    return { res, attempts, startedAt, caughtErr };
   }
 
-  const event: UsageEvent = {
-    operation: "seniorCrossCheck",
-    model: MODEL,
-    input_tokens: res?.usage?.input_tokens ?? 0,
-    output_tokens: res?.usage?.output_tokens ?? 0,
-    cache_creation_input_tokens: res?.usage?.cache_creation_input_tokens ?? 0,
-    cache_read_input_tokens: res?.usage?.cache_read_input_tokens ?? 0,
-    duration_ms: Date.now() - started,
-    attempts,
-    had_pdf: false,
-    ok: !caughtErr,
-    error: caughtErr ? String(caughtErr?.message ?? caughtErr).slice(0, 200) : undefined
-  };
-  emitUsage(event);
+  let { res, attempts, startedAt, caughtErr } = await callOnce(true);
 
+  // Caso erro de rede/SDK: emite ok=false e sai.
   if (caughtErr) {
-    console.error(
-      "seniorCrossCheck failed:",
-      String((caughtErr as any)?.message ?? caughtErr).slice(0, 200)
+    const ev = buildSeniorUsageEvent({ res, startedAt, attempts, caughtErr });
+    emitUsage(ev);
+    console.error("seniorCrossCheck failed:", ev.error);
+    return [];
+  }
+
+  // Diagnostica response. Se não tem text mas tem thinking, retenta sem thinking.
+  let diag = diagnoseResponse(res);
+  if (!diag.has_text) {
+    const errFromThinking = diagnosticToErrorMsg(
+      diag,
+      "thinking-only response (no text/tool_use)"
     );
-    return [];
+    // Emite primeiro evento como falha (telemetria do problema), depois retenta.
+    emitUsage(
+      buildSeniorUsageEvent({
+        res,
+        startedAt,
+        attempts,
+        caughtErr: null,
+        errorOverride: errFromThinking
+      })
+    );
+    console.warn(
+      "[seniorCrossCheck] retry sem thinking após response sem text:",
+      errFromThinking.slice(0, 250)
+    );
+    const retry = await callOnce(false);
+    res = retry.res;
+    attempts = retry.attempts;
+    startedAt = retry.startedAt;
+    caughtErr = retry.caughtErr;
+    if (caughtErr) {
+      const ev = buildSeniorUsageEvent({ res, startedAt, attempts, caughtErr });
+      emitUsage(ev);
+      console.error("seniorCrossCheck retry failed:", ev.error);
+      return [];
+    }
+    diag = diagnoseResponse(res);
+    if (!diag.has_text) {
+      const ev = buildSeniorUsageEvent({
+        res,
+        startedAt,
+        attempts,
+        caughtErr: null,
+        errorOverride: diagnosticToErrorMsg(
+          diag,
+          "retry sem thinking ainda sem text"
+        )
+      });
+      emitUsage(ev);
+      console.error("seniorCrossCheck failed:", ev.error);
+      return [];
+    }
   }
 
-  // Quando thinking está ativo, content tem blocks "thinking" antes do "text". Pegar APENAS text.
   const textBlock = (res.content ?? []).find((b: any) => b?.type === "text");
-  if (!textBlock || textBlock.type !== "text" || typeof textBlock.text !== "string") {
-    console.error("seniorCrossCheck failed:", "Claude não retornou bloco de texto");
-    return [];
-  }
-
   const raw = stripJsonFences(textBlock.text);
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch (err: any) {
-    console.error(
-      "seniorCrossCheck failed:",
-      `JSON parse error: ${String(err?.message ?? err).slice(0, 120)}`
-    );
+    const ev = buildSeniorUsageEvent({
+      res,
+      startedAt,
+      attempts,
+      caughtErr: null,
+      errorOverride: `JSON parse error: ${String(err?.message ?? err).slice(
+        0,
+        150
+      )} | text_preview=${JSON.stringify(raw.slice(0, 500))}`
+    });
+    emitUsage(ev);
+    console.error("seniorCrossCheck failed:", ev.error);
     return [];
   }
 
   const result = SeniorOutputSchema.safeParse(parsed);
   if (!result.success) {
-    console.error(
-      "seniorCrossCheck failed:",
-      `Zod validation error: ${result.error.issues
-        .slice(0, 3)
-        .map((i) => `${i.path.join(".")}: ${i.message}`)
-        .join("; ")
-        .slice(0, 200)}`
-    );
+    const issues = result.error.issues
+      .slice(0, 3)
+      .map((i) => `${i.path.join(".")}: ${i.message}`)
+      .join("; ")
+      .slice(0, 300);
+    const ev = buildSeniorUsageEvent({
+      res,
+      startedAt,
+      attempts,
+      caughtErr: null,
+      errorOverride: `Zod validation: ${issues} | text_preview=${JSON.stringify(
+        raw.slice(0, 500)
+      )}`
+    });
+    emitUsage(ev);
+    console.error("seniorCrossCheck failed:", ev.error);
     return [];
   }
+
+  // Sucesso: emite evento final com ok=true.
+  emitUsage(buildSeniorUsageEvent({ res, startedAt, attempts, caughtErr: null }));
 
   let findings = result.data.findings as Finding[];
 
@@ -632,73 +800,134 @@ ${findingsBlock}
 
 Use a tool report_adversarial_decisions e devolva exatamente uma decisão por finding listado acima (mesmo finding_index).`;
 
-  const started = Date.now();
-  let attempts = 0;
-  let res: any;
-  let caughtErr: any;
-
-  try {
-    res = await callWithRetry(() => {
-      attempts++;
-      return client.messages.create({
-        model: MODEL,
-        max_tokens: 8192,
-        thinking: { type: "adaptive" } as any,
-        system: [
-          {
-            type: "text",
-            text: ADVERSARIAL_SYSTEM,
-            cache_control: { type: "ephemeral" }
-          } as any
-        ],
-        tools: [
-          {
-            name: "report_adversarial_decisions",
-            description:
-              "Devolve as decisões adversariais (keep/drop/weaken) para cada finding listado.",
-            input_schema: ADVERSARIAL_TOOL_SCHEMA as any
-          }
-        ],
-        // tool_choice: "auto" porque Anthropic não permite thinking + tool_choice forçado.
-        tool_choice: { type: "auto" } as any,
-        messages: [
-          {
-            role: "user",
-            content: [{ type: "text", text: userPrompt }]
-          }
-        ]
+  // Mesma estratégia do senior: tenta com thinking, se vier só thinking sem
+  // tool_use/text, retenta sem thinking (forçando tool_choice).
+  async function callOnce(useThinking: boolean): Promise<{
+    res: any;
+    attempts: number;
+    startedAt: number;
+    caughtErr: any;
+  }> {
+    const startedAt = Date.now();
+    let attempts = 0;
+    let res: any;
+    let caughtErr: any;
+    try {
+      res = await callWithRetry(() => {
+        attempts++;
+        const params: any = {
+          model: MODEL,
+          max_tokens: useThinking ? 8192 : 12000,
+          system: [
+            {
+              type: "text",
+              text: ADVERSARIAL_SYSTEM,
+              cache_control: { type: "ephemeral" }
+            } as any
+          ],
+          tools: [
+            {
+              name: "report_adversarial_decisions",
+              description:
+                "Devolve as decisões adversariais (keep/drop/weaken) para cada finding listado.",
+              input_schema: ADVERSARIAL_TOOL_SCHEMA as any
+            }
+          ],
+          messages: [
+            {
+              role: "user",
+              content: [{ type: "text", text: userPrompt }]
+            }
+          ]
+        };
+        if (useThinking) {
+          // tool_choice: "auto" porque Anthropic não permite thinking + tool_choice forçado.
+          params.thinking = { type: "adaptive" } as any;
+          params.tool_choice = { type: "auto" } as any;
+        } else {
+          // Sem thinking podemos forçar tool_use.
+          params.tool_choice = {
+            type: "tool",
+            name: "report_adversarial_decisions"
+          } as any;
+        }
+        return client.messages.create(params);
       });
-    });
-  } catch (err) {
-    caughtErr = err;
+    } catch (err) {
+      caughtErr = err;
+    }
+    return { res, attempts, startedAt, caughtErr };
   }
 
-  const event: UsageEvent = {
-    operation: "adversarialReview",
-    model: MODEL,
-    input_tokens: res?.usage?.input_tokens ?? 0,
-    output_tokens: res?.usage?.output_tokens ?? 0,
-    cache_creation_input_tokens: res?.usage?.cache_creation_input_tokens ?? 0,
-    cache_read_input_tokens: res?.usage?.cache_read_input_tokens ?? 0,
-    duration_ms: Date.now() - started,
-    attempts,
-    had_pdf: false,
-    ok: !caughtErr,
-    error: caughtErr
-      ? String(caughtErr?.message ?? caughtErr).slice(0, 200)
-      : undefined
-  };
-  emitUsage(event);
+  let { res, attempts, startedAt, caughtErr } = await callOnce(true);
 
   if (caughtErr) {
-    console.error(
-      "adversarialReview failed:",
-      String((caughtErr as any)?.message ?? caughtErr).slice(0, 200)
-    );
+    const ev = buildAdversarialUsageEvent({
+      res,
+      startedAt,
+      attempts,
+      caughtErr
+    });
+    emitUsage(ev);
+    console.error("adversarialReview failed:", ev.error);
     return [];
   }
 
-  // Com tool_choice forçado, esperamos um content block do tipo "tool_use".
+  let diag = diagnoseResponse(res, "report_adversarial_decisions");
+  if (!diag.has_tool_use && !diag.has_text) {
+    const errFromThinking = diagnosticToErrorMsg(
+      diag,
+      "thinking-only response (no tool_use/text)"
+    );
+    emitUsage(
+      buildAdversarialUsageEvent({
+        res,
+        startedAt,
+        attempts,
+        caughtErr: null,
+        errorOverride: errFromThinking
+      })
+    );
+    console.warn(
+      "[adversarialReview] retry sem thinking após response sem tool_use/text:",
+      errFromThinking.slice(0, 250)
+    );
+    const retry = await callOnce(false);
+    res = retry.res;
+    attempts = retry.attempts;
+    startedAt = retry.startedAt;
+    caughtErr = retry.caughtErr;
+    if (caughtErr) {
+      const ev = buildAdversarialUsageEvent({
+        res,
+        startedAt,
+        attempts,
+        caughtErr
+      });
+      emitUsage(ev);
+      console.error("adversarialReview retry failed:", ev.error);
+      return [];
+    }
+    diag = diagnoseResponse(res, "report_adversarial_decisions");
+    if (!diag.has_tool_use && !diag.has_text) {
+      const ev = buildAdversarialUsageEvent({
+        res,
+        startedAt,
+        attempts,
+        caughtErr: null,
+        errorOverride: diagnosticToErrorMsg(
+          diag,
+          "retry sem thinking ainda sem tool_use/text"
+        )
+      });
+      emitUsage(ev);
+      console.error("adversarialReview failed:", ev.error);
+      return [];
+    }
+  }
+
+  // Com tool_choice forçado (no retry) ou tool_use opcional (na 1a tentativa),
+  // esperamos um content block do tipo "tool_use".
   const toolBlock = (res.content ?? []).find(
     (b: any) => b?.type === "tool_use" && b?.name === "report_adversarial_decisions"
   );
@@ -710,35 +939,65 @@ Use a tool report_adversarial_decisions e devolva exatamente uma decisão por fi
     // Fallback: tenta extrair texto se por algum motivo não vier tool_use.
     const textBlock = (res.content ?? []).find((b: any) => b?.type === "text");
     if (!textBlock || typeof textBlock.text !== "string") {
-      console.error(
-        "adversarialReview failed:",
-        "Claude não retornou tool_use nem bloco de texto"
-      );
+      const ev = buildAdversarialUsageEvent({
+        res,
+        startedAt,
+        attempts,
+        caughtErr: null,
+        errorOverride: diagnosticToErrorMsg(
+          diagnoseResponse(res, "report_adversarial_decisions"),
+          "no tool_use, no text"
+        )
+      });
+      emitUsage(ev);
+      console.error("adversarialReview failed:", ev.error);
       return [];
     }
     try {
       parsed = JSON.parse(stripJsonFences(textBlock.text));
     } catch (err: any) {
-      console.error(
-        "adversarialReview failed:",
-        `JSON parse error: ${String(err?.message ?? err).slice(0, 120)}`
-      );
+      const ev = buildAdversarialUsageEvent({
+        res,
+        startedAt,
+        attempts,
+        caughtErr: null,
+        errorOverride: `JSON parse error: ${String(err?.message ?? err).slice(
+          0,
+          150
+        )} | text_preview=${JSON.stringify(textBlock.text.slice(0, 500))}`
+      });
+      emitUsage(ev);
+      console.error("adversarialReview failed:", ev.error);
       return [];
     }
   }
 
   const result = AdversarialOutputSchema.safeParse(parsed);
   if (!result.success) {
-    console.error(
-      "adversarialReview failed:",
-      `Zod validation error: ${result.error.issues
-        .slice(0, 3)
-        .map((i) => `${i.path.join(".")}: ${i.message}`)
-        .join("; ")
-        .slice(0, 200)}`
-    );
+    const issues = result.error.issues
+      .slice(0, 3)
+      .map((i) => `${i.path.join(".")}: ${i.message}`)
+      .join("; ")
+      .slice(0, 300);
+    const ev = buildAdversarialUsageEvent({
+      res,
+      startedAt,
+      attempts,
+      caughtErr: null,
+      errorOverride: `Zod validation: ${issues} | parsed_preview=${jsonClip(
+        parsed,
+        500
+      )}`
+    });
+    emitUsage(ev);
+    console.error("adversarialReview failed:", ev.error);
     return [];
   }
+
+  // Sucesso.
+  emitUsage(
+    buildAdversarialUsageEvent({ res, startedAt, attempts, caughtErr: null })
+  );
 
   // Normaliza: weakened_severity null vira undefined; só mantém se verdict === "weaken".
   const decisions: AdversarialDecision[] = result.data.decisions.map((d) => {
@@ -769,14 +1028,26 @@ export async function adversarialReview(
     return { decisions: [] };
   }
 
+  const startedTotal = Date.now();
   let client: Anthropic;
   try {
     client = getClient();
   } catch (err: any) {
-    console.error(
-      "adversarialReview failed:",
-      String(err?.message ?? err).slice(0, 200)
-    );
+    const errMsg = String(err?.message ?? err).slice(0, 200);
+    console.error("adversarialReview failed:", errMsg);
+    emitUsage({
+      operation: "adversarialReview",
+      model: MODEL,
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      duration_ms: Date.now() - startedTotal,
+      attempts: 0,
+      had_pdf: false,
+      ok: false,
+      error: `getClient: ${errMsg}`
+    });
     return { decisions: [] };
   }
 
@@ -822,10 +1093,21 @@ export async function adversarialReview(
     return { decisions: merged };
   } catch (err: any) {
     // Best-effort: nunca propaga.
-    console.error(
-      "adversarialReview failed:",
-      String(err?.message ?? err).slice(0, 200)
-    );
+    const errMsg = String(err?.message ?? err).slice(0, 200);
+    console.error("adversarialReview failed:", errMsg);
+    emitUsage({
+      operation: "adversarialReview",
+      model: MODEL,
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      duration_ms: Date.now() - startedTotal,
+      attempts: 0,
+      had_pdf: false,
+      ok: false,
+      error: `outer catch: ${errMsg}`
+    });
     return { decisions: [] };
   }
 }

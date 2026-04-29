@@ -12,7 +12,8 @@ import type {
 } from "../schemas/forms";
 import type { I360Form, VawaStoryFacts } from "../schemas/vawa";
 import type { I918Form, I918BForm, UVisaStoryFacts } from "../schemas/uvisa";
-import type { PassportSignatureCheck } from "./claude";
+import type { PassportSignatureCheck, UsageEvent } from "./claude";
+import { emitUsage } from "./claude";
 
 // =============================================================================
 // RFE Prediction Layer
@@ -497,18 +498,58 @@ function buildContextSummary(input: RFEPredictionInput): string {
   return lines.join("\n");
 }
 
+function buildRfeUsageEvent(args: {
+  res: any;
+  startedAt: number;
+  attempts: number;
+  caughtErr: any;
+  errorOverride?: string;
+}): UsageEvent {
+  const { res, startedAt, attempts, caughtErr, errorOverride } = args;
+  const errStr = errorOverride
+    ? errorOverride
+    : caughtErr
+      ? String(caughtErr?.message ?? caughtErr).slice(0, 1500)
+      : undefined;
+  return {
+    operation: "predictRFEs",
+    model: MODEL,
+    input_tokens: res?.usage?.input_tokens ?? 0,
+    output_tokens: res?.usage?.output_tokens ?? 0,
+    cache_creation_input_tokens: res?.usage?.cache_creation_input_tokens ?? 0,
+    cache_read_input_tokens: res?.usage?.cache_read_input_tokens ?? 0,
+    duration_ms: Date.now() - startedAt,
+    attempts,
+    had_pdf: false,
+    ok: !caughtErr && !errorOverride,
+    error: errStr
+  };
+}
+
 async function refineWithLLM(
   deterministic: RFEPrediction[],
   input: RFEPredictionInput
 ): Promise<RFEPrediction[] | null> {
+  const startedTotal = Date.now();
   let client: Anthropic;
   try {
     client = getClient();
   } catch (err: any) {
-    console.error(
-      "predictRFEs LLM refine falhou:",
-      String(err?.message ?? err).slice(0, 200)
-    );
+    const errMsg = String(err?.message ?? err).slice(0, 200);
+    console.error("predictRFEs LLM refine falhou:", errMsg);
+    emitUsage({
+      operation: "predictRFEs",
+      model: MODEL,
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      duration_ms: Date.now() - startedTotal,
+      attempts: 0,
+      had_pdf: false,
+      ok: false,
+      error: `getClient: ${errMsg}`
+    });
     return null;
   }
 
@@ -534,69 +575,226 @@ Devolva via tool ${LLM_TOOL_NAME} a lista REFINADA de RFE predictions:
 
 Cada predição deve incluir trigger_findings com referência aos rule_ids/campos que a sustentam.`;
 
-  let res: any;
-  try {
-    res = await client.messages.create({
-      model: MODEL,
-      max_tokens: 8192,
-      thinking: { type: "adaptive" } as any,
-      system: [
-        {
-          type: "text",
-          text: REFINE_SYSTEM,
-          cache_control: { type: "ephemeral" }
-        } as any
-      ],
-      tools: [
-        {
-          name: LLM_TOOL_NAME,
-          description:
-            "Devolve a lista refinada de RFE predictions (filtra falsos positivos, adiciona o que faltou, ranqueia por likelihood).",
-          input_schema: RFE_TOOL_SCHEMA as any
-        }
-      ],
-      // tool_choice: "auto" porque Anthropic não permite thinking + tool_choice forçado.
-      tool_choice: { type: "auto" } as any,
-      messages: [
-        {
-          role: "user",
-          content: [{ type: "text", text: userPrompt }]
-        }
-      ]
-    });
-  } catch (err: any) {
-    console.error(
-      "predictRFEs LLM refine falhou:",
-      String(err?.message ?? err).slice(0, 200)
-    );
+  // Mesma estratégia do senior/adversarial: tenta com thinking; se vier só
+  // thinking sem tool_use/text, retenta sem thinking forçando tool_use.
+  async function callOnce(useThinking: boolean): Promise<{
+    res: any;
+    attempts: number;
+    startedAt: number;
+    caughtErr: any;
+  }> {
+    const startedAt = Date.now();
+    let attempts = 1;
+    let res: any;
+    let caughtErr: any;
+    try {
+      const params: any = {
+        model: MODEL,
+        max_tokens: useThinking ? 8192 : 12000,
+        system: [
+          {
+            type: "text",
+            text: REFINE_SYSTEM,
+            cache_control: { type: "ephemeral" }
+          } as any
+        ],
+        tools: [
+          {
+            name: LLM_TOOL_NAME,
+            description:
+              "Devolve a lista refinada de RFE predictions (filtra falsos positivos, adiciona o que faltou, ranqueia por likelihood).",
+            input_schema: RFE_TOOL_SCHEMA as any
+          }
+        ],
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: userPrompt }]
+          }
+        ]
+      };
+      if (useThinking) {
+        // tool_choice: "auto" porque Anthropic não permite thinking + tool_choice forçado.
+        params.thinking = { type: "adaptive" } as any;
+        params.tool_choice = { type: "auto" } as any;
+      } else {
+        params.tool_choice = { type: "tool", name: LLM_TOOL_NAME } as any;
+      }
+      res = await client.messages.create(params);
+    } catch (err) {
+      caughtErr = err;
+    }
+    return { res, attempts, startedAt, caughtErr };
+  }
+
+  let { res, attempts, startedAt, caughtErr } = await callOnce(true);
+
+  if (caughtErr) {
+    const ev = buildRfeUsageEvent({ res, startedAt, attempts, caughtErr });
+    emitUsage(ev);
+    console.error("predictRFEs LLM refine falhou:", ev.error);
     return null;
   }
 
-  // Com tool_choice forçado, esperamos um content block do tipo "tool_use".
+  function diagnose(r: any): {
+    has_text: boolean;
+    has_tool_use: boolean;
+    has_thinking: boolean;
+    types: string[];
+    stop_reason: string | null;
+    output_tokens: number;
+    text_preview: string | null;
+  } {
+    const content: any[] = r?.content ?? [];
+    const types: string[] = content.map((b: any) => b?.type ?? "unknown");
+    const textBlock = content.find((b: any) => b?.type === "text");
+    const toolBlock = content.find(
+      (b: any) => b?.type === "tool_use" && b?.name === LLM_TOOL_NAME
+    );
+    const text =
+      textBlock && typeof textBlock.text === "string" ? textBlock.text : null;
+    return {
+      has_text: !!textBlock && typeof textBlock?.text === "string",
+      has_tool_use: !!toolBlock,
+      has_thinking: types.includes("thinking"),
+      types,
+      stop_reason: r?.stop_reason ?? null,
+      output_tokens: r?.usage?.output_tokens ?? 0,
+      text_preview: text ? text.slice(0, 500) : null
+    };
+  }
+
+  function diagToErr(d: ReturnType<typeof diagnose>, prefix: string): string {
+    const parts = [
+      prefix,
+      `stop_reason=${d.stop_reason ?? "unknown"}`,
+      `content_types=[${d.types.join(",")}]`,
+      `output_tokens=${d.output_tokens}`,
+      `has_text=${d.has_text}`,
+      `has_tool_use=${d.has_tool_use}`,
+      `has_thinking=${d.has_thinking}`
+    ];
+    if (d.text_preview) {
+      parts.push(`text_preview=${JSON.stringify(d.text_preview)}`);
+    }
+    return parts.join(" | ").slice(0, 1500);
+  }
+
+  let diag = diagnose(res);
+  if (!diag.has_tool_use && !diag.has_text) {
+    const errFromThinking = diagToErr(
+      diag,
+      "thinking-only response (no tool_use/text)"
+    );
+    emitUsage(
+      buildRfeUsageEvent({
+        res,
+        startedAt,
+        attempts,
+        caughtErr: null,
+        errorOverride: errFromThinking
+      })
+    );
+    console.warn(
+      "[predictRFEs] retry sem thinking após response sem tool_use/text:",
+      errFromThinking.slice(0, 250)
+    );
+    const retry = await callOnce(false);
+    res = retry.res;
+    attempts = retry.attempts;
+    startedAt = retry.startedAt;
+    caughtErr = retry.caughtErr;
+    if (caughtErr) {
+      const ev = buildRfeUsageEvent({ res, startedAt, attempts, caughtErr });
+      emitUsage(ev);
+      console.error("predictRFEs LLM refine retry failed:", ev.error);
+      return null;
+    }
+    diag = diagnose(res);
+    if (!diag.has_tool_use && !diag.has_text) {
+      const ev = buildRfeUsageEvent({
+        res,
+        startedAt,
+        attempts,
+        caughtErr: null,
+        errorOverride: diagToErr(diag, "retry sem thinking ainda sem tool_use/text")
+      });
+      emitUsage(ev);
+      console.error("predictRFEs LLM refine falhou:", ev.error);
+      return null;
+    }
+  }
+
   const toolBlock = (res?.content ?? []).find(
     (b: any) => b?.type === "tool_use" && b?.name === LLM_TOOL_NAME
   );
 
-  if (!toolBlock || !toolBlock.input || typeof toolBlock.input !== "object") {
-    console.error(
-      "predictRFEs LLM refine falhou:",
-      "Claude não retornou tool_use válido"
-    );
+  let parsed: unknown = null;
+  if (toolBlock && toolBlock.input && typeof toolBlock.input === "object") {
+    parsed = toolBlock.input;
+  } else {
+    // fallback texto
+    const textBlock = (res?.content ?? []).find((b: any) => b?.type === "text");
+    if (textBlock && typeof textBlock.text === "string") {
+      try {
+        // Heurística: tentar extrair JSON inline.
+        const m = textBlock.text.match(/```(?:json)?\s*([\s\S]*?)```/);
+        const raw = (m ? m[1] : textBlock.text).trim();
+        parsed = JSON.parse(raw);
+      } catch (err: any) {
+        const ev = buildRfeUsageEvent({
+          res,
+          startedAt,
+          attempts,
+          caughtErr: null,
+          errorOverride: `JSON parse fallback failed: ${String(
+            err?.message ?? err
+          ).slice(0, 150)} | text_preview=${JSON.stringify(
+            textBlock.text.slice(0, 500)
+          )}`
+        });
+        emitUsage(ev);
+        console.error("predictRFEs LLM refine falhou:", ev.error);
+        return null;
+      }
+    } else {
+      const ev = buildRfeUsageEvent({
+        res,
+        startedAt,
+        attempts,
+        caughtErr: null,
+        errorOverride: diagToErr(diagnose(res), "no tool_use, no text")
+      });
+      emitUsage(ev);
+      console.error("predictRFEs LLM refine falhou:", ev.error);
+      return null;
+    }
+  }
+
+  const result = RFEOutputSchema.safeParse(parsed);
+  if (!result.success) {
+    const issues = result.error.issues
+      .slice(0, 3)
+      .map((i) => `${i.path.join(".")}: ${i.message}`)
+      .join("; ")
+      .slice(0, 300);
+    const ev = buildRfeUsageEvent({
+      res,
+      startedAt,
+      attempts,
+      caughtErr: null,
+      errorOverride: `Zod validation: ${issues} | parsed_preview=${jsonClip(
+        parsed,
+        500
+      )}`
+    });
+    emitUsage(ev);
+    console.error("predictRFEs LLM refine falhou:", ev.error);
     return null;
   }
 
-  const result = RFEOutputSchema.safeParse(toolBlock.input);
-  if (!result.success) {
-    console.error(
-      "predictRFEs LLM refine falhou:",
-      `Zod validation: ${result.error.issues
-        .slice(0, 3)
-        .map((i) => `${i.path.join(".")}: ${i.message}`)
-        .join("; ")
-        .slice(0, 200)}`
-    );
-    return null;
-  }
+  // Sucesso.
+  emitUsage(buildRfeUsageEvent({ res, startedAt, attempts, caughtErr: null }));
 
   return result.data.predictions as RFEPrediction[];
 }
@@ -643,10 +841,21 @@ export async function predictRFEs(
       const refined = await refineWithLLM(predictions, input);
       if (refined && refined.length > 0) predictions = refined;
     } catch (err) {
-      console.error(
-        "predictRFEs LLM refine falhou:",
-        String((err as any)?.message ?? err).slice(0, 200)
-      );
+      const errMsg = String((err as any)?.message ?? err).slice(0, 200);
+      console.error("predictRFEs LLM refine falhou:", errMsg);
+      emitUsage({
+        operation: "predictRFEs",
+        model: MODEL,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        duration_ms: 0,
+        attempts: 0,
+        had_pdf: false,
+        ok: false,
+        error: `outer catch: ${errMsg}`
+      });
     }
   }
 
