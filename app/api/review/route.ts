@@ -5,6 +5,11 @@ import { saveReview, saveUsageEvents } from "@/lib/db";
 import { estimateCostUSD } from "@/lib/pricing";
 import { logEvent } from "@/lib/logger";
 import { getCurrentUser } from "@/lib/auth/current-user";
+import {
+  isStorageEnabled,
+  uploadReviewPdf,
+  buildReviewPdfKey
+} from "@/lib/storage";
 
 export const runtime = "nodejs";
 export const maxDuration = 500;
@@ -35,6 +40,21 @@ export async function POST(req: NextRequest) {
       caseTypeRaw === "vawa" ? "vawa" : caseTypeRaw === "u_visa" ? "u_visa" : "t_visa";
 
     const result = await reviewProcess({ buffer, mode, caseType });
+
+    let pdfObjectKey: string | null = null;
+    if (isStorageEnabled()) {
+      try {
+        await uploadReviewPdf(reviewId, buffer, file.name);
+        pdfObjectKey = buildReviewPdfKey(reviewId);
+      } catch (err) {
+        logEvent({
+          level: "warn",
+          msg: "review.pdf_upload_failed",
+          review_id: reviewId,
+          error: err instanceof Error ? err.message : String(err)
+        });
+      }
+    }
 
     const usageTotals = {
       input_tokens: 0,
@@ -77,7 +97,8 @@ export async function POST(req: NextRequest) {
       report_json: JSON.stringify(result.report),
       debug_json: JSON.stringify(result.debug),
       user_id: user.id,
-      case_type: caseType
+      case_type: caseType,
+      pdf_object_key: pdfObjectKey
     });
 
     saveUsageEvents(

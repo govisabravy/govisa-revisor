@@ -187,6 +187,10 @@ function getDb(): Database.Database {
   }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_reviews_case_type ON reviews(case_type)`);
 
+  if (!hasColumn(db, "reviews", "pdf_object_key")) {
+    db.exec(`ALTER TABLE reviews ADD COLUMN pdf_object_key TEXT`);
+  }
+
   return db;
 }
 
@@ -216,6 +220,7 @@ export interface ReviewRecord {
   debug_json: string;
   user_id?: string | null;
   case_type?: string | null;
+  pdf_object_key?: string | null;
 }
 
 export interface UsageEventRecord {
@@ -253,17 +258,18 @@ export function saveReview(record: ReviewRecord): void {
       total_findings, critical_count, high_count, medium_count, low_count,
       tier1_count, tier2_count, tier3_count,
       elapsed_ms, total_input_tokens, total_output_tokens, total_cache_creation_tokens, total_cache_read_tokens,
-      estimated_cost_usd, report_json, debug_json, user_id, case_type)
+      estimated_cost_usd, report_json, debug_json, user_id, case_type, pdf_object_key)
      VALUES (@id, @created_at, @file_name, @file_size, @num_pages, @client_name, @forms_detected,
       @total_findings, @critical_count, @high_count, @medium_count, @low_count,
       @tier1_count, @tier2_count, @tier3_count,
       @elapsed_ms, @total_input_tokens, @total_output_tokens, @total_cache_creation_tokens, @total_cache_read_tokens,
-      @estimated_cost_usd, @report_json, @debug_json, @user_id, @case_type)`
+      @estimated_cost_usd, @report_json, @debug_json, @user_id, @case_type, @pdf_object_key)`
   );
   stmt.run({
     ...record,
     user_id: record.user_id ?? null,
     case_type: record.case_type ?? null,
+    pdf_object_key: record.pdf_object_key ?? null,
     forms_detected: JSON.stringify(record.forms_detected)
   });
 }
