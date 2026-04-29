@@ -4,7 +4,25 @@ import { mkdirSync } from "fs";
 
 const dbDir = path.join(process.cwd(), "data");
 mkdirSync(dbDir, { recursive: true });
-const dbPath = path.join(dbDir, process.env.AUTH_DB_PATH ?? "govisa-revisor.db");
+
+// DB path resolution priority:
+// 1. AUTH_DB_PATH (override explícito — útil pra testes)
+// 2. NODE_ENV=production → prod.db (no Coolify)
+// 3. NODE_ENV=development OU undefined → dev.db (local)
+// 4. fallback legado govisa-revisor.db
+function resolveDbName(): string {
+  if (process.env.AUTH_DB_PATH) return process.env.AUTH_DB_PATH;
+  if (process.env.NODE_ENV === "production") return "prod.db";
+  if (process.env.NODE_ENV === "development") return "dev.db";
+  return "govisa-revisor.db";
+}
+const dbPath = path.join(dbDir, resolveDbName());
+if (!process.env.GOVISA_DB_QUIET) {
+  // eslint-disable-next-line no-console
+  console.log(
+    `[db] usando ${dbPath} (NODE_ENV=${process.env.NODE_ENV ?? "unset"})`
+  );
+}
 
 let db: Database.Database | null = null;
 
@@ -91,6 +109,72 @@ function getDb(): Database.Database {
     );
 
     CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+    CREATE TABLE IF NOT EXISTS login_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      created_at TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      user_id TEXT,
+      email_attempted TEXT,
+      ip TEXT,
+      user_agent TEXT,
+      metadata TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_login_events_user ON login_events(user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_login_events_created ON login_events(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_login_events_type ON login_events(event_type, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS admin_audit (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      created_at TEXT NOT NULL,
+      action TEXT NOT NULL,
+      actor_user_id TEXT NOT NULL,
+      target_user_id TEXT,
+      metadata TEXT,
+      ip TEXT,
+      user_agent TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_admin_audit_actor ON admin_audit(actor_user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_admin_audit_target ON admin_audit(target_user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_admin_audit_created ON admin_audit(created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS finding_feedback (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      review_id TEXT NOT NULL,
+      finding_hash TEXT NOT NULL,
+      rule_id TEXT NOT NULL,
+      subject_id TEXT,
+      user_id TEXT NOT NULL,
+      verdict TEXT NOT NULL CHECK(verdict IN ('correct','incorrect')),
+      error_type TEXT,
+      note TEXT,
+      created_at TEXT NOT NULL,
+      UNIQUE(review_id, finding_hash, user_id),
+      FOREIGN KEY (review_id) REFERENCES reviews(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_feedback_rule ON finding_feedback(rule_id, verdict);
+    CREATE INDEX IF NOT EXISTS idx_feedback_review ON finding_feedback(review_id);
+
+    CREATE TABLE IF NOT EXISTS missing_finding_reports (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      review_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL,
+      suggested_severity TEXT,
+      suggested_rule_id TEXT,
+      subject_id TEXT,
+      form TEXT,
+      status TEXT NOT NULL DEFAULT 'open',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (review_id) REFERENCES reviews(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_missing_review ON missing_finding_reports(review_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_missing_status ON missing_finding_reports(status, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_missing_user ON missing_finding_reports(user_id, created_at DESC);
   `);
 
   if (!hasColumn(db, "reviews", "user_id")) {
@@ -303,6 +387,14 @@ export function getUserByEmail(email: string): UserRecord | null {
   return row ?? null;
 }
 
+export function getUserByEmailIncludingInactive(email: string): UserRecord | null {
+  const d = getDb();
+  const row = d
+    .prepare(`SELECT * FROM users WHERE email = ?`)
+    .get(email.toLowerCase().trim()) as any;
+  return row ?? null;
+}
+
 export function getUserById(id: string): UserRecord | null {
   const d = getDb();
   const row = d.prepare(`SELECT * FROM users WHERE id = ?`).get(id) as any;
@@ -317,6 +409,7 @@ export function listUsers(): UserRecord[] {
 export function updateUser(
   id: string,
   patch: Partial<{
+    email: string;
     name: string | null;
     role: "admin" | "user";
     active: number;
@@ -355,4 +448,355 @@ export function countUsers(): number {
 
 export function getDatabase(): Database.Database {
   return getDb();
+}
+
+export type LoginEventType =
+  | "login_ok"
+  | "login_fail"
+  | "logout"
+  | "password_change"
+  | "rate_limited";
+
+export interface LoginEventInput {
+  event_type: LoginEventType;
+  user_id?: string | null;
+  email_attempted?: string | null;
+  ip?: string | null;
+  user_agent?: string | null;
+  metadata?: Record<string, any> | null;
+}
+
+export function recordLoginEvent(input: LoginEventInput): void {
+  const d = getDb();
+  d.prepare(
+    `INSERT INTO login_events (created_at, event_type, user_id, email_attempted, ip, user_agent, metadata)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    new Date().toISOString(),
+    input.event_type,
+    input.user_id ?? null,
+    input.email_attempted ? input.email_attempted.toLowerCase().trim() : null,
+    input.ip ?? null,
+    input.user_agent ?? null,
+    input.metadata ? JSON.stringify(input.metadata) : null
+  );
+}
+
+export interface LoginEventRow {
+  id: number;
+  created_at: string;
+  event_type: LoginEventType;
+  user_id: string | null;
+  email_attempted: string | null;
+  ip: string | null;
+  user_agent: string | null;
+  metadata: any;
+}
+
+export function listLoginEvents(opts: {
+  userId?: string;
+  eventType?: LoginEventType;
+  limit?: number;
+} = {}): LoginEventRow[] {
+  const d = getDb();
+  const limit = opts.limit ?? 100;
+  const conds: string[] = [];
+  const values: any[] = [];
+  if (opts.userId) {
+    conds.push("user_id = ?");
+    values.push(opts.userId);
+  }
+  if (opts.eventType) {
+    conds.push("event_type = ?");
+    values.push(opts.eventType);
+  }
+  const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+  values.push(limit);
+  const rows = d
+    .prepare(`SELECT * FROM login_events ${where} ORDER BY created_at DESC LIMIT ?`)
+    .all(...values) as any[];
+  return rows.map((r) => ({ ...r, metadata: r.metadata ? JSON.parse(r.metadata) : null }));
+}
+
+export type AdminAuditAction =
+  | "user_created"
+  | "user_role_changed"
+  | "user_activated"
+  | "user_deactivated"
+  | "user_email_changed"
+  | "user_name_changed"
+  | "password_reset_by_admin";
+
+export interface AdminAuditInput {
+  action: AdminAuditAction;
+  actor_user_id: string;
+  target_user_id?: string | null;
+  metadata?: Record<string, any> | null;
+  ip?: string | null;
+  user_agent?: string | null;
+}
+
+export function recordAdminAudit(input: AdminAuditInput): void {
+  const d = getDb();
+  d.prepare(
+    `INSERT INTO admin_audit (created_at, action, actor_user_id, target_user_id, metadata, ip, user_agent)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    new Date().toISOString(),
+    input.action,
+    input.actor_user_id,
+    input.target_user_id ?? null,
+    input.metadata ? JSON.stringify(input.metadata) : null,
+    input.ip ?? null,
+    input.user_agent ?? null
+  );
+}
+
+export interface AdminAuditRow {
+  id: number;
+  created_at: string;
+  action: AdminAuditAction;
+  actor_user_id: string;
+  target_user_id: string | null;
+  metadata: any;
+  ip: string | null;
+  user_agent: string | null;
+}
+
+export function listAdminAudit(opts: {
+  actorUserId?: string;
+  targetUserId?: string;
+  limit?: number;
+} = {}): AdminAuditRow[] {
+  const d = getDb();
+  const limit = opts.limit ?? 100;
+  const conds: string[] = [];
+  const values: any[] = [];
+  if (opts.actorUserId) {
+    conds.push("actor_user_id = ?");
+    values.push(opts.actorUserId);
+  }
+  if (opts.targetUserId) {
+    conds.push("target_user_id = ?");
+    values.push(opts.targetUserId);
+  }
+  const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+  values.push(limit);
+  const rows = d
+    .prepare(`SELECT * FROM admin_audit ${where} ORDER BY created_at DESC LIMIT ?`)
+    .all(...values) as any[];
+  return rows.map((r) => ({ ...r, metadata: r.metadata ? JSON.parse(r.metadata) : null }));
+}
+
+export interface FindingFeedbackRow {
+  finding_hash: string;
+  rule_id: string;
+  subject_id: string | null;
+  user_id: string;
+  verdict: "correct" | "incorrect";
+  error_type: string | null;
+  note: string | null;
+  created_at: string;
+}
+
+export function upsertFindingFeedback(input: {
+  review_id: string;
+  finding_hash: string;
+  rule_id: string;
+  subject_id?: string | null;
+  user_id: string;
+  verdict: "correct" | "incorrect";
+  error_type?: string | null;
+  note?: string | null;
+}): void {
+  const d = getDb();
+  const now = new Date().toISOString();
+  d.prepare(
+    `INSERT INTO finding_feedback
+       (review_id, finding_hash, rule_id, subject_id, user_id, verdict, error_type, note, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(review_id, finding_hash, user_id) DO UPDATE SET
+       verdict = excluded.verdict,
+       error_type = excluded.error_type,
+       note = excluded.note,
+       rule_id = excluded.rule_id,
+       subject_id = excluded.subject_id,
+       created_at = excluded.created_at`
+  ).run(
+    input.review_id,
+    input.finding_hash,
+    input.rule_id,
+    input.subject_id ?? null,
+    input.user_id,
+    input.verdict,
+    input.error_type ?? null,
+    input.note ?? null,
+    now
+  );
+}
+
+export function listFindingFeedback(reviewId: string): FindingFeedbackRow[] {
+  const d = getDb();
+  const rows = d
+    .prepare(
+      `SELECT finding_hash, rule_id, subject_id, user_id, verdict, error_type, note, created_at
+       FROM finding_feedback
+       WHERE review_id = ?
+       ORDER BY created_at DESC`
+    )
+    .all(reviewId) as any[];
+  return rows;
+}
+
+export function aggregateFeedbackByRuleId(opts: { since?: string } = {}): Array<{
+  rule_id: string;
+  total: number;
+  correct: number;
+  incorrect: number;
+  rate_incorrect: number;
+}> {
+  const d = getDb();
+  const conds: string[] = [];
+  const values: any[] = [];
+  if (opts.since) {
+    conds.push("created_at >= ?");
+    values.push(opts.since);
+  }
+  const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+  const rows = d
+    .prepare(
+      `SELECT rule_id,
+              COUNT(*) AS total,
+              SUM(CASE WHEN verdict = 'correct' THEN 1 ELSE 0 END) AS correct,
+              SUM(CASE WHEN verdict = 'incorrect' THEN 1 ELSE 0 END) AS incorrect
+       FROM finding_feedback
+       ${where}
+       GROUP BY rule_id
+       ORDER BY incorrect DESC, total DESC`
+    )
+    .all(...values) as any[];
+  return rows.map((r) => {
+    const total = Number(r.total ?? 0);
+    const correct = Number(r.correct ?? 0);
+    const incorrect = Number(r.incorrect ?? 0);
+    return {
+      rule_id: r.rule_id,
+      total,
+      correct,
+      incorrect,
+      rate_incorrect: total > 0 ? incorrect / total : 0
+    };
+  });
+}
+
+// ===========================================================================
+// Missing finding reports — usuário aponta erros que o sistema NÃO detectou
+// (vira dataset de calibração de RECALL)
+// ===========================================================================
+
+export interface MissingFindingReportRow {
+  id: number;
+  review_id: string;
+  user_id: string;
+  title: string;
+  description: string;
+  suggested_severity: string | null;
+  suggested_rule_id: string | null;
+  subject_id: string | null;
+  form: string | null;
+  status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export function insertMissingFindingReport(input: {
+  review_id: string;
+  user_id: string;
+  title: string;
+  description: string;
+  suggested_severity?: string | null;
+  suggested_rule_id?: string | null;
+  subject_id?: string | null;
+  form?: string | null;
+}): number {
+  const d = getDb();
+  const now = new Date().toISOString();
+  const r = d
+    .prepare(
+      `INSERT INTO missing_finding_reports
+        (review_id, user_id, title, description, suggested_severity,
+         suggested_rule_id, subject_id, form, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)`
+    )
+    .run(
+      input.review_id,
+      input.user_id,
+      input.title,
+      input.description,
+      input.suggested_severity ?? null,
+      input.suggested_rule_id ?? null,
+      input.subject_id ?? null,
+      input.form ?? null,
+      now,
+      now
+    );
+  return Number(r.lastInsertRowid);
+}
+
+export function listMissingFindingReports(
+  reviewId: string
+): MissingFindingReportRow[] {
+  const d = getDb();
+  return d
+    .prepare(
+      `SELECT id, review_id, user_id, title, description, suggested_severity,
+              suggested_rule_id, subject_id, form, status, created_at, updated_at
+       FROM missing_finding_reports
+       WHERE review_id = ?
+       ORDER BY created_at DESC`
+    )
+    .all(reviewId) as MissingFindingReportRow[];
+}
+
+export function listAllMissingFindingReports(opts: {
+  status?: string;
+  since?: string;
+  limit?: number;
+} = {}): Array<MissingFindingReportRow & { client_name: string | null }> {
+  const d = getDb();
+  const conds: string[] = [];
+  const values: any[] = [];
+  if (opts.status) {
+    conds.push("m.status = ?");
+    values.push(opts.status);
+  }
+  if (opts.since) {
+    conds.push("m.created_at >= ?");
+    values.push(opts.since);
+  }
+  const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+  const limit = Math.min(Math.max(1, opts.limit ?? 100), 500);
+  return d
+    .prepare(
+      `SELECT m.*, r.client_name
+       FROM missing_finding_reports m
+       LEFT JOIN reviews r ON r.id = m.review_id
+       ${where}
+       ORDER BY m.created_at DESC
+       LIMIT ${limit}`
+    )
+    .all(...values) as Array<MissingFindingReportRow & { client_name: string | null }>;
+}
+
+export function updateMissingFindingReportStatus(
+  id: number,
+  status: "open" | "triaged" | "resolved" | "wont_fix"
+): boolean {
+  const d = getDb();
+  const r = d
+    .prepare(
+      `UPDATE missing_finding_reports SET status = ?, updated_at = ? WHERE id = ?`
+    )
+    .run(status, new Date().toISOString(), id);
+  return r.changes > 0;
 }

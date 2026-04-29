@@ -5,14 +5,21 @@ export interface SessionData {
   userId?: string;
   role?: "admin" | "user";
   mustChangePassword?: boolean;
+  createdAt?: number;
 }
 
 const secret = process.env.SESSION_SECRET ?? "";
+
 if (secret.length < 32) {
-  console.warn(
-    "SESSION_SECRET vazio ou < 32 chars. Configure um valor longo no .env.local."
-  );
+  const msg =
+    "SESSION_SECRET ausente ou < 32 chars. Gere com `openssl rand -hex 32` e configure a env var.";
+  if (process.env.NODE_ENV === "production") {
+    throw new Error(msg);
+  }
+  console.warn(`[session] ${msg} (dev fallback em uso — NÃO usar em prod)`);
 }
+
+export const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7;
 
 export const sessionOptions: SessionOptions = {
   password: secret.padEnd(32, "x"),
@@ -21,7 +28,7 @@ export const sessionOptions: SessionOptions = {
     httpOnly: true,
     sameSite: "lax",
     secure: process.env.NODE_ENV === "production",
-    maxAge: 60 * 60 * 24 * 7
+    maxAge: SESSION_TTL_SECONDS
   }
 };
 

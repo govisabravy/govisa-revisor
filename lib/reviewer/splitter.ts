@@ -8,6 +8,8 @@ export interface SubDocument {
   base64: string;
   text: string;
   pageCount: number;
+  subject_id?: string | null;
+  holder_name?: string | null;
 }
 
 export interface PageRange {
@@ -15,6 +17,8 @@ export interface PageRange {
   title: string;
   startPage: number;
   endPage: number;
+  subject_id?: string | null;
+  holder_name?: string | null;
 }
 
 function isTocPage(pageText: string): boolean {
@@ -205,7 +209,9 @@ export async function splitPdfByRanges(
       endPage: range.endPage,
       base64: Buffer.from(bytes).toString("base64"),
       text,
-      pageCount: indexes.length
+      pageCount: indexes.length,
+      subject_id: range.subject_id ?? null,
+      holder_name: range.holder_name ?? null
     });
   }
 

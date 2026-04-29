@@ -1,7 +1,23 @@
 import Anthropic from "@anthropic-ai/sdk";
+import type { Finding, FormData } from "../schemas/forms";
 import type { UVisaStoryFacts, I918Form, I918AForm, I918BForm } from "../schemas/uvisa";
+import { parseDate } from "./rules";
+import { RULE_IDS } from "./rule_ids";
 
-const MODEL = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6";
+// Helper local: idade em uma data de referência a partir de DOB string
+function ageAtDateLocalU(dob?: string | null, at: Date = new Date()): number | null {
+  const d = parseDate(dob);
+  if (!d) return null;
+  let age = at.getFullYear() - d.getFullYear();
+  const m = at.getMonth() - d.getMonth();
+  if (m < 0 || (m === 0 && at.getDate() < d.getDate())) age--;
+  return age;
+}
+
+// I-192 type extracted from FormData union (same shape as in T-visa)
+type I192Form = Extract<FormData, { form: "I-192" }>;
+
+const MODEL = process.env.ANTHROPIC_MODEL ?? "claude-opus-4-7";
 function client() {
   return new Anthropic({
     apiKey: process.env.ANTHROPIC_API_KEY ?? "placeholder",
@@ -63,8 +79,17 @@ export async function extractI918FromText(args: { text: string; pdfBase64?: stri
   "physical_address": {...}, "safe_mailing_address": {...}|null,
   "qualifying_criminal_activity": string[],
   "inadmissibility_requires_waiver": boolean|null,
-  "family_members_included": [{"relationship": string|null, "name": string|null, "date_of_birth": string|null}]
+  "family_members_included": [{
+    "relationship": string|null, "name": string|null, "date_of_birth": string|null,
+    "country_of_citizenship": string|null,
+    "country_of_residence": string|null,
+    "is_us_citizen": boolean|null
+  }]
 }
+
+Dicas:
+- "is_us_citizen" = true se o family member é declarado como cidadão americano (USC). Filhos americanos não precisam de I-918A.
+- "country_of_residence" = país onde o family member reside. Familiares fora dos EUA podem aparecer em consular processing.
 
 TEXTO:
 """${args.text.slice(0, 14000)}"""`,
@@ -166,67 +191,107 @@ export interface UVisaRulesInput {
   i918as: I918AForm[];
   i918b: I918BForm | null;
   story: UVisaStoryFacts | null;
+  /** Opcional — quando presente, regras de waiver podem rebaixar severidade. */
+  i192?: I192Form | null;
 }
 
-export function applyUVisaRules(args: UVisaRulesInput): any[] {
-  const out: any[] = [];
-  const { i918, i918as, i918b, story } = args;
+function norm(v?: string | null): string {
+  return (v ?? "").toString().trim().toUpperCase().replace(/\s+/g, " ");
+}
+
+export function applyUVisaRules(args: UVisaRulesInput): Finding[] {
+  const out: Finding[] = [];
+  const { i918, i918as, i918b, story, i192 } = args;
 
   if (!i918) {
     out.push({
       severity: "critica", tier: "tier1_filing", category: "campo_vazio",
-      field: "I-918 não encontrado", explanation: "Processo U-visa requer I-918 principal. Não foi detectado."
+      field: "I-918 não encontrado", form: null,
+      explanation: "Processo U-visa requer I-918 principal. Não foi detectado.",
+      rule_id: RULE_IDS.U_FILING_I918_MISSING,
+      subject_id: null
     });
     return out;
   }
 
   // I-918B (certification by LEA) é OBRIGATÓRIO pra U-visa
   if (!i918b) {
-    out.push({
-      severity: "critica", tier: "tier2_substantivo", category: "elegibilidade",
-      field: "I-918B (Certification)", form: "I-918B",
-      explanation: "U-visa EXIGE I-918 Supplement B assinado por agência certificadora qualificada. Sem isso, a petição não pode ser aprovada.",
-      recommendation: "Obter certificação de LEA qualificada (polícia, promotoria, juiz, EEOC, DOL, CPS)."
-    });
+    // Ajuste obs 4 (Flavia): se há I-192 com waiver/exemption mencionando "non-cooperation",
+    // rebaixa de critica para alta + nota.
+    const i192Text =
+      `${(i192?.grounds_of_inadmissibility ?? []).join(" | ")} ${i192?.waiver_justification_summary ?? ""}`.toLowerCase();
+    const hasWaiverHint =
+      /non[-\s]?cooperation|nao[-\s]?coopera|não[-\s]?coopera|exemption/.test(i192Text);
+    if (hasWaiverHint) {
+      out.push({
+        severity: "alta", tier: "tier2_substantivo", category: "elegibilidade",
+        field: "I-918B (Certification) — waiver de não cooperação detectado", form: "I-918B",
+        explanation:
+          "I-918B ausente. No entanto, foi identificada menção a 'non-cooperation' / waiver / exemption no I-192. Confirmar elegibilidade da exemption antes do filing.",
+        recommendation:
+          "Confirmar fundamentos da exemption de cooperação. Se aplicável, anexar declaração explicando a impossibilidade de obter I-918B + secondary evidence.",
+        rule_id: RULE_IDS.U_SUBST_I918B_MISSING_WITH_WAIVER,
+        subject_id: null
+      });
+    } else {
+      out.push({
+        severity: "critica", tier: "tier2_substantivo", category: "elegibilidade",
+        field: "I-918B (Certification)", form: "I-918B",
+        explanation: "U-visa EXIGE I-918 Supplement B assinado por agência certificadora qualificada. Sem isso, a petição não pode ser aprovada.",
+        recommendation: "Obter certificação de LEA qualificada (polícia, promotoria, juiz, EEOC, DOL, CPS).",
+        rule_id: RULE_IDS.U_SUBST_I918B_MISSING_NO_WAIVER,
+        subject_id: null
+      });
+    }
   } else {
     if (i918b.is_qualifying_agency === false) {
       out.push({
         severity: "critica", tier: "tier2_substantivo", category: "elegibilidade",
         field: "I-918B — Agência qualificada", form: "I-918B",
         found: i918b.certifying_agency ?? "(não identificada)",
-        explanation: "Agência certificadora não é qualificada para U-visa conforme 8 CFR 214.14(a)(2)."
+        explanation: "Agência certificadora não é qualificada para U-visa conforme 8 CFR 214.14(a)(2).",
+        rule_id: RULE_IDS.U_SUBST_I918B_AGENCY_NOT_QUALIFYING,
+        subject_id: null
       });
     }
     if (!i918b.signature?.signed) {
       out.push({
         severity: "critica", tier: "tier1_filing", category: "assinatura",
         field: "I-918B — Assinatura do Certifying Official", form: "I-918B",
-        explanation: "I-918B precisa estar assinado pelo oficial certificador."
+        explanation: "I-918B precisa estar assinado pelo oficial certificador.",
+        rule_id: RULE_IDS.U_FILING_I918B_NOT_SIGNED,
+        subject_id: null
       });
     }
     if (!i918b.certifying_official_title) {
       out.push({
         severity: "alta", tier: "tier1_filing", category: "campo_vazio",
         field: "I-918B — Título do oficial", form: "I-918B",
-        explanation: "Título/cargo do certifying official ausente."
+        explanation: "Título/cargo do certifying official ausente.",
+        rule_id: RULE_IDS.U_FILING_I918B_OFFICER_TITLE_EMPTY,
+        subject_id: null
       });
     }
     if (i918b.helpfulness_confirmed === false) {
       out.push({
         severity: "critica", tier: "tier2_substantivo", category: "elegibilidade",
         field: "I-918B — Helpfulness", form: "I-918B",
-        explanation: "I-918B não confirma que o peticionário foi/é/será helpful ao LEA."
+        explanation: "I-918B não confirma que o peticionário foi/é/será helpful ao LEA.",
+        rule_id: RULE_IDS.U_SUBST_I918B_HELPFULNESS_MISSING,
+        subject_id: null
       });
     }
     // Data da I-918B não pode ser muito antiga — 6 meses window (boa prática)
     if (i918b.signature?.date_signed) {
       const d = new Date(i918b.signature.date_signed);
-      const days = (Date.now() - d.getTime()) / (1000*60*60*24);
+      const days = (Date.now() - d.getTime()) / (1000 * 60 * 60 * 24);
       if (!isNaN(days) && days > 180) {
         out.push({
           severity: "media", tier: "tier3_estrategico", category: "estrategia",
           field: "I-918B — assinada há mais de 6 meses", form: "I-918B",
-          explanation: `Assinada em ${i918b.signature.date_signed}. Acima de 6 meses pode gerar RFE pedindo atualização.`
+          explanation: `Assinada em ${i918b.signature.date_signed}. Acima de 6 meses pode gerar RFE pedindo atualização.`,
+          rule_id: RULE_IDS.U_SUBST_I918B_OLD,
+          subject_id: null
         });
       }
     }
@@ -237,7 +302,9 @@ export function applyUVisaRules(args: UVisaRulesInput): any[] {
     out.push({
       severity: "critica", tier: "tier2_substantivo", category: "elegibilidade",
       field: "Qualifying Criminal Activity", form: "I-918",
-      explanation: "I-918 não lista qualifying criminal activity na Part 3."
+      explanation: "I-918 não lista qualifying criminal activity na Part 3.",
+      rule_id: RULE_IDS.U_SUBST_NO_QUALIFYING_CRIME,
+      subject_id: null
     });
   }
 
@@ -248,21 +315,27 @@ export function applyUVisaRules(args: UVisaRulesInput): any[] {
         severity: "critica", tier: "tier2_substantivo", category: "elegibilidade",
         field: "Substantial physical or mental abuse", form: null,
         explanation: "U-visa exige substantial physical OR mental abuse. Não caracterizado na história.",
-        recommendation: "Revisar declaração para descrever lesões físicas, PTSD, ansiedade, depressão, impacto na vida diária."
+        recommendation: "Revisar declaração para descrever lesões físicas, PTSD, ansiedade, depressão, impacto na vida diária.",
+        rule_id: RULE_IDS.U_SUBST_NO_SUBSTANTIAL_ABUSE,
+        subject_id: null
       });
     }
     if ((story.abuse_examples ?? []).length < 2) {
       out.push({
         severity: "alta", tier: "tier2_substantivo", category: "credibilidade",
         field: "Exemplos concretos do crime/abuso", form: null,
-        explanation: "Poucos exemplos específicos do crime. Adjudicador prefere fatos, episódios, datas."
+        explanation: "Poucos exemplos específicos do crime. Adjudicador prefere fatos, episódios, datas.",
+        rule_id: RULE_IDS.U_SUBST_LOW_ABUSE_EXAMPLES,
+        subject_id: null
       });
     }
     if (story.cooperation_with_lea_status === "none") {
       out.push({
         severity: "critica", tier: "tier2_substantivo", category: "elegibilidade",
         field: "Cooperation com LEA", form: null,
-        explanation: "História não menciona cooperação passada, atual ou futura com law enforcement."
+        explanation: "História não menciona cooperação passada, atual ou futura com law enforcement.",
+        rule_id: RULE_IDS.U_SUBST_NO_COOPERATION,
+        subject_id: null
       });
     }
     // Bate crime mencionado na história com lista
@@ -273,7 +346,9 @@ export function applyUVisaRules(args: UVisaRulesInput): any[] {
         severity: "alta", tier: "tier2_substantivo", category: "elegibilidade",
         field: "Crime mencionado fora da lista qualifying", form: null,
         found: mentioned.join(", "),
-        explanation: "Crime mencionado na história pode não estar na lista de qualifying criminal activity do U-visa. Verificar 8 CFR 214.14(a)(9)."
+        explanation: "Crime mencionado na história pode não estar na lista de qualifying criminal activity do U-visa. Verificar 8 CFR 214.14(a)(9).",
+        rule_id: RULE_IDS.U_SUBST_CRIME_NOT_QUALIFYING,
+        subject_id: null
       });
     }
   }
@@ -290,7 +365,9 @@ export function applyUVisaRules(args: UVisaRulesInput): any[] {
           field: "Crime divergente I-918 vs I-918B", form: "I-918B",
           expected: `${i918Crimes.join(", ")} (I-918)`,
           found: `${i918bCrimes.join(", ")} (I-918B)`,
-          explanation: "Crime listado no I-918 não bate com o listado no I-918B pela agência certificadora."
+          explanation: "Crime listado no I-918 não bate com o listado no I-918B pela agência certificadora.",
+          rule_id: RULE_IDS.U_CONS_CRIME_I918_VS_I918B,
+          subject_id: null
         });
       }
     }
@@ -305,7 +382,134 @@ export function applyUVisaRules(args: UVisaRulesInput): any[] {
         severity: "alta", tier: "tier2_substantivo", category: "divergencia",
         field: "Nome da vítima I-918B x nome I-918", form: "I-918B",
         expected: fullName, found: i918b.victim_name,
-        explanation: "Nome da vítima no I-918B diverge do peticionário no I-918."
+        explanation: "Nome da vítima no I-918B diverge do peticionário no I-918.",
+        rule_id: RULE_IDS.U_CONS_VICTIM_NAME_DIVERGE,
+        subject_id: null
+      });
+    }
+  }
+
+  // Regras de I-918A (dependentes da U-visa) — análogas a T-visa
+  if (i918 && i918as.length > 0) {
+    const principal = i918.person;
+    for (const a of i918as) {
+      const sid = (a as any)._subject_id ?? null;
+      // Nome do principal no I-918A diverge?
+      if (a.principal_applicant) {
+        const pa = a.principal_applicant;
+        if (
+          norm(pa.family_name) &&
+          norm(principal.family_name) &&
+          norm(pa.family_name) !== norm(principal.family_name)
+        ) {
+          out.push({
+            severity: "critica", tier: "tier1_filing", category: "divergencia",
+            field: "I-918A — Principal Applicant Family Name", form: "I-918A",
+            expected: `${principal.family_name} (I-918)`,
+            found: `${pa.family_name} (I-918A)`,
+            explanation:
+              "Family Name do Principal Applicant no I-918A não bate com o Family Name do principal no I-918.",
+            rule_id: RULE_IDS.U_DEP_I918A_PRINCIPAL_NAME_DIVERGE,
+            subject_id: sid
+          });
+        }
+        if (
+          norm(pa.given_name) &&
+          norm(principal.given_name) &&
+          norm(pa.given_name) !== norm(principal.given_name)
+        ) {
+          out.push({
+            severity: "critica", tier: "tier1_filing", category: "divergencia",
+            field: "I-918A — Principal Applicant Given Name", form: "I-918A",
+            expected: `${principal.given_name} (I-918)`,
+            found: `${pa.given_name} (I-918A)`,
+            explanation:
+              "Given Name do Principal Applicant no I-918A não bate com o Given Name do principal no I-918.",
+            rule_id: RULE_IDS.U_DEP_I918A_PRINCIPAL_NAME_DIVERGE,
+            subject_id: sid
+          });
+        }
+      }
+      if (!a.relationship_to_principal) {
+        out.push({
+          severity: "alta", tier: "tier2_substantivo", category: "elegibilidade",
+          field: "I-918A — Relationship to Principal", form: "I-918A",
+          explanation: "I-918A não indica o qualifying relationship com o principal.",
+          rule_id: RULE_IDS.U_DEP_I918A_NO_QUALIFYING_REL,
+          subject_id: sid
+        });
+      }
+      if (!a.relationship_evidence_mentioned || a.relationship_evidence_mentioned.length === 0) {
+        out.push({
+          severity: "alta", tier: "tier1_filing", category: "suporte_documental",
+          field: "I-918A — Evidência da relação", form: "I-918A",
+          explanation:
+            "I-918A deve ser acompanhado de evidência do qualifying relationship (certidão de nascimento/casamento).",
+          rule_id: RULE_IDS.U_DEP_I918A_NO_EVIDENCE,
+          subject_id: sid
+        });
+      }
+    }
+  }
+
+  // Q9 — CSPA age-out risk para derivativos U-visa (filhos com 20-21 anos no filing)
+  const filingDateU = parseDate(i918?.meta?.applicant_signature?.date_signed) ?? new Date();
+  const cspaPoolU: Array<{ name?: string | null; date_of_birth?: string | null; relationship?: string | null }> = [];
+  if (i918?.family_members_included) {
+    for (const fm of i918.family_members_included) {
+      const rel = (fm.relationship ?? "").toLowerCase();
+      if (/child|son|daughter|filho|filha/.test(rel)) {
+        cspaPoolU.push({ name: fm.name, date_of_birth: fm.date_of_birth, relationship: rel });
+      } else if (!fm.relationship) {
+        // Sem relationship explícito, só inclui se o DOB sugerir criança/jovem
+        cspaPoolU.push({ name: fm.name, date_of_birth: fm.date_of_birth, relationship: null });
+      }
+    }
+  }
+  if (story?.children) {
+    for (const c of story.children) {
+      cspaPoolU.push({ name: c.name, date_of_birth: c.date_of_birth, relationship: "child" });
+    }
+  }
+  const seenU = new Set<string>();
+  for (const c of cspaPoolU) {
+    const age = ageAtDateLocalU(c.date_of_birth, filingDateU);
+    if (age === null) continue;
+    if (age >= 20 && age < 21) {
+      const key = `${(c.name ?? "").toLowerCase().trim()}|${c.date_of_birth ?? ""}`;
+      if (seenU.has(key)) continue;
+      seenU.add(key);
+      out.push({
+        severity: "alta", tier: "tier2_substantivo", category: "elegibilidade",
+        field: `CSPA age-out risk — ${c.name ?? "filho(a)"}`, form: "I-918",
+        explanation: `${c.name ?? "Filho(a)"} tem ${age} anos no filing date — aproximando-se de 21 anos. Risco de envelhecer durante processamento USCIS antes da aprovação. CSPA INA 203(h) protege parcialmente derivativos U-visa.`,
+        recommendation:
+          "Acelerar I-918A. Documentar filing date com clareza. Avaliar request expedite junto ao VSC.",
+        rule_id: RULE_IDS.U_DEP_CSPA_AGE_OUT_RISK,
+        subject_id: null
+      });
+    }
+  }
+
+  // Q14 — Prior false claim to U.S. citizenship (versão simplificada)
+  if (story) {
+    const FALSE_CLAIM_RX_U =
+      /claim(?:ed)?[\s\w]*citizenship|alega[çc][ãa]o de cidadania|claimed?\s+(?:to be\s+)?(?:u\.?s\.?|usc|american)|\bvoted\b|\bvoto\b|i-?9[\s,]*citizen|passport application|social security[\s\w]*citizen/i;
+    const haystackU = [
+      (story.cooperation_details ?? ""),
+      (story.abuse_examples ?? []).join(" | "),
+      (story.psychological_impact ?? []).join(" | ")
+    ].join(" | ");
+    if (FALSE_CLAIM_RX_U.test(haystackU)) {
+      out.push({
+        severity: "critica", tier: "tier2_substantivo", category: "elegibilidade",
+        field: "Prior false claim to U.S. citizenship (INA 212(a)(6)(C)(ii))", form: null,
+        explanation:
+          "Possível false claim to U.S. citizenship detectada na história. INA 212(a)(6)(C)(ii) NÃO tem waiver — pode matar o U-visa. Verificar com cliente urgentemente.",
+        recommendation:
+          "Confirmar com cliente registro como votante, declaração de cidadania em I-9, social security ou passport application. Avaliar timely retraction ou idade < 18 ao fazer a declaração.",
+        rule_id: RULE_IDS.U_SUBST_FALSE_CLAIM_RISK,
+        subject_id: null
       });
     }
   }

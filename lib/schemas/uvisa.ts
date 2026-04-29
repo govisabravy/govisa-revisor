@@ -12,7 +12,10 @@ export const I918Schema = z.object({
   family_members_included: z.array(z.object({
     relationship: z.string().nullable().optional(),
     name: z.string().nullable().optional(),
-    date_of_birth: z.string().nullable().optional()
+    date_of_birth: z.string().nullable().optional(),
+    country_of_citizenship: z.string().nullable().optional(),
+    country_of_residence: z.string().nullable().optional(),
+    is_us_citizen: z.boolean().nullable().optional()
   })).default([])
 });
 

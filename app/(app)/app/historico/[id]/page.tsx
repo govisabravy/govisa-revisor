@@ -9,6 +9,7 @@ import { ArrowLeft, Clock, DollarSign, Hash } from "lucide-react";
 export default function HistoricoDetailPage() {
   const params = useParams<{ id: string }>();
   const [data, setData] = useState<any>(null);
+  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -16,6 +17,12 @@ export default function HistoricoDetailPage() {
       .then((r) => r.json())
       .then((d) => setData(d))
       .finally(() => setLoading(false));
+    fetch("/api/me")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((u) => {
+        if (u?.id) setCurrentUserId(u.id);
+      })
+      .catch(() => {});
   }, [params.id]);
 
   if (loading) return <div className="p-12 text-center text-slate-500">Carregando...</div>;
@@ -60,7 +67,11 @@ export default function HistoricoDetailPage() {
           </div>
         </div>
 
-        <ReviewReportView report={data.report} />
+        <ReviewReportView
+          report={data.report}
+          reviewId={params.id}
+          currentUserId={currentUserId ?? undefined}
+        />
 
         <details className="bg-white rounded-2xl p-5 border border-slate-200">
           <summary className="font-semibold cursor-pointer">Telemetria por operação</summary>

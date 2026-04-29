@@ -10,6 +10,7 @@ export default function AdminRevisaoDetail() {
   const params = useParams<{ id: string }>();
   const [data, setData] = useState<any>(null);
   const [userInfo, setUserInfo] = useState<any>(null);
+  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -24,6 +25,12 @@ export default function AdminRevisaoDetail() {
         }
       })
       .finally(() => setLoading(false));
+    fetch("/api/me")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((u) => {
+        if (u?.id) setCurrentUserId(u.id);
+      })
+      .catch(() => {});
   }, [params.id]);
 
   if (loading) return <div className="p-12 text-center text-slate-500">Carregando...</div>;
@@ -67,7 +74,11 @@ export default function AdminRevisaoDetail() {
           </div>
         </div>
 
-        <ReviewReportView report={data.report} />
+        <ReviewReportView
+          report={data.report}
+          reviewId={params.id}
+          currentUserId={currentUserId ?? undefined}
+        />
       </div>
     </main>
   );

@@ -100,6 +100,15 @@ function LoginForm() {
           {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
           Entrar
         </button>
+
+        <div className="text-center">
+          <a
+            href="mailto:tiago@asv.digital?subject=Go%20Visa%20Revisor%20-%20Acesso"
+            className="text-xs text-slate-500 hover:text-govisa-navy"
+          >
+            Esqueci minha senha — falar com o admin
+          </a>
+        </div>
       </form>
     </main>
   );

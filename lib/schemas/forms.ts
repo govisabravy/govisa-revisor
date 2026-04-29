@@ -83,7 +83,10 @@ export const I914Schema = z.object({
         relationship: z.string().nullable().optional(),
         name: z.string().nullable().optional(),
         date_of_birth: z.string().nullable().optional(),
-        marital_status: z.string().nullable().optional()
+        marital_status: z.string().nullable().optional(),
+        country_of_citizenship: z.string().nullable().optional(),
+        country_of_residence: z.string().nullable().optional(),
+        is_us_citizen: z.boolean().nullable().optional()
       })
     )
     .default([]),
@@ -292,6 +295,30 @@ export const TranslationsCheckSchema = z.object({
 });
 export type TranslationsCheck = z.infer<typeof TranslationsCheckSchema>;
 
+export const SubjectSchema = z.object({
+  id: z.string(),
+  role: z.enum(["principal", "dependent"]),
+  display_name: z.string(),
+  family_name: z.string().nullable().optional(),
+  given_name: z.string().nullable().optional(),
+  date_of_birth: z.string().nullable().optional(),
+  country_of_citizenship: z.string().nullable().optional(),
+  relationship_to_principal: z.string().nullable().optional()
+});
+export type Subject = z.infer<typeof SubjectSchema>;
+
+export const ProofOfAddressAnalysisSchema = z.object({
+  found: z.boolean(),
+  holder_name: z.string().nullable().optional(),
+  holder_match: z.enum(["principal", "dependent", "no_match", "unknown"]).nullable().optional(),
+  matched_subject_id: z.string().nullable().optional(),
+  address: AddressSchema.optional(),
+  document_type: z.string().nullable().optional(),
+  document_date: z.string().nullable().optional(),
+  notes: z.string().nullable().optional()
+});
+export type ProofOfAddressAnalysis = z.infer<typeof ProofOfAddressAnalysisSchema>;
+
 export type FindingSeverity = "critica" | "alta" | "media" | "baixa";
 export type FindingTier = "tier1_filing" | "tier2_substantivo" | "tier3_estrategico";
 export type FindingCategory =
@@ -303,7 +330,8 @@ export type FindingCategory =
   | "credibilidade"
   | "suporte_documental"
   | "assinatura"
-  | "estrategia";
+  | "estrategia"
+  | "cross_narrative";
 
 export const FindingSchema = z.object({
   severity: z.enum(["critica", "alta", "media", "baixa"]),
@@ -317,7 +345,8 @@ export const FindingSchema = z.object({
     "credibilidade",
     "suporte_documental",
     "assinatura",
-    "estrategia"
+    "estrategia",
+    "cross_narrative"
   ]),
   field: z.string(),
   form: z.string().nullable().optional(),
@@ -325,13 +354,17 @@ export const FindingSchema = z.object({
   found: z.string().nullable().optional(),
   source: z.string().nullable().optional(),
   explanation: z.string(),
-  recommendation: z.string().nullable().optional()
+  recommendation: z.string().nullable().optional(),
+  rule_id: z.string().optional(),
+  subject_id: z.string().nullable().optional(),
+  prompt_version: z.string().optional()
 });
 export type Finding = z.infer<typeof FindingSchema>;
 
 export const ReviewReportSchema = z.object({
   client_name: z.string().nullable().optional(),
   forms_detected: z.array(z.string()),
+  subjects: z.array(SubjectSchema).default([]),
   findings: z.array(FindingSchema),
   summary: z.object({
     total: z.number(),
@@ -343,7 +376,26 @@ export const ReviewReportSchema = z.object({
       tier1_filing: z.number(),
       tier2_substantivo: z.number(),
       tier3_estrategico: z.number()
-    })
-  })
+    }),
+    by_subject: z.record(z.string(), z.number()).optional()
+  }),
+  proof_of_address: ProofOfAddressAnalysisSchema.nullable().optional()
 });
 export type ReviewReport = z.infer<typeof ReviewReportSchema>;
+
+export type FeedbackErrorType =
+  | "falso_positivo"
+  | "categoria_errada"
+  | "severidade_errada"
+  | "explicacao_imprecisa"
+  | "recomendacao_errada"
+  | "outro";
+
+export const FeedbackErrorTypeValues: FeedbackErrorType[] = [
+  "falso_positivo",
+  "categoria_errada",
+  "severidade_errada",
+  "explicacao_imprecisa",
+  "recomendacao_errada",
+  "outro"
+];

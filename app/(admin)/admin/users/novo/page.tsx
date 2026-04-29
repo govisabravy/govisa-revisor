@@ -3,7 +3,7 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import Link from "next/link";
-import { ArrowLeft, Loader2 } from "lucide-react";
+import { ArrowLeft, Loader2, Eye, EyeOff } from "lucide-react";
 
 export default function NovoUser() {
   const router = useRouter();
@@ -11,6 +11,7 @@ export default function NovoUser() {
   const [name, setName] = useState("");
   const [role, setRole] = useState<"admin" | "user">("user");
   const [pwd, setPwd] = useState("");
+  const [showPwd, setShowPwd] = useState(false);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -59,9 +60,26 @@ export default function NovoUser() {
           </div>
           <div>
             <label className="text-xs font-semibold text-slate-600 uppercase">Senha temporária</label>
-            <input type="text" required minLength={8} value={pwd} onChange={(e) => setPwd(e.target.value)}
-              className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:border-govisa-navy"
-              placeholder="mínimo 8 caracteres" />
+            <div className="relative mt-1">
+              <input
+                type={showPwd ? "text" : "password"}
+                required
+                minLength={8}
+                value={pwd}
+                onChange={(e) => setPwd(e.target.value)}
+                className="w-full rounded-xl border border-slate-300 px-3 py-2 pr-10 text-sm focus:outline-none focus:border-govisa-navy"
+                placeholder="mínimo 8 caracteres"
+                autoComplete="new-password"
+              />
+              <button
+                type="button"
+                onClick={() => setShowPwd((v) => !v)}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-700"
+                aria-label={showPwd ? "Esconder senha" : "Mostrar senha"}
+              >
+                {showPwd ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              </button>
+            </div>
             <p className="text-xs text-slate-500 mt-1">Usuário será obrigado a trocar no primeiro login.</p>
           </div>
           {err && <div className="bg-red-50 border border-red-300 text-red-800 text-sm rounded-xl px-3 py-2">{err}</div>}

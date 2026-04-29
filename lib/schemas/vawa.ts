@@ -17,7 +17,9 @@ export const I360Schema = z.object({
   good_moral_character_declared: z.boolean().nullable().optional(),
   children_included: z.array(z.object({
     name: z.string().nullable().optional(),
-    date_of_birth: z.string().nullable().optional()
+    date_of_birth: z.string().nullable().optional(),
+    country_of_citizenship: z.string().nullable().optional(),
+    is_us_citizen: z.boolean().nullable().optional()
   })).default([])
 });
 

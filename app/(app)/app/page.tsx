@@ -22,6 +22,8 @@ interface Recent {
 export default function NewReview() {
   const [loading, setLoading] = useState(false);
   const [report, setReport] = useState<ReviewReport | null>(null);
+  const [reviewId, setReviewId] = useState<string | null>(null);
+  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [fileName, setFileName] = useState<string | null>(null);
   const [mode, setMode] = useState<"draft" | "final">("draft");
@@ -33,12 +35,19 @@ export default function NewReview() {
       .then((r) => r.json())
       .then((data) => setRecent(data.items?.slice(0, 5) ?? []))
       .catch(() => setRecent([]));
+    fetch("/api/me")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((u) => {
+        if (u?.id) setCurrentUserId(u.id);
+      })
+      .catch(() => {});
   }, []);
 
   async function handleFile(file: File) {
     setLoading(true);
     setError(null);
     setReport(null);
+    setReviewId(null);
     setFileName(file.name);
     try {
       const fd = new FormData();
@@ -51,7 +60,26 @@ export default function NewReview() {
         throw new Error(body.error ?? `HTTP ${res.status}`);
       }
       const data = await res.json();
-      setReport(data.report);
+      const newId: string | undefined = data.review_id;
+      // Buscar versão enriquecida (com _hash em cada finding) do GET
+      if (newId) {
+        try {
+          const enrichedRes = await fetch(`/api/reviews/${newId}`);
+          if (enrichedRes.ok) {
+            const enriched = await enrichedRes.json();
+            setReport(enriched.report);
+            setReviewId(newId);
+          } else {
+            setReport(data.report);
+            setReviewId(newId);
+          }
+        } catch {
+          setReport(data.report);
+          setReviewId(newId);
+        }
+      } else {
+        setReport(data.report);
+      }
     } catch (err: any) {
       setError(err?.message ?? "Erro ao revisar processo.");
     } finally {
@@ -61,6 +89,7 @@ export default function NewReview() {
 
   function reset() {
     setReport(null);
+    setReviewId(null);
     setError(null);
     setFileName(null);
   }
@@ -214,7 +243,13 @@ export default function NewReview() {
           </div>
         )}
 
-        {report && <ReviewReportView report={report} />}
+        {report && (
+          <ReviewReportView
+            report={report}
+            reviewId={reviewId ?? undefined}
+            currentUserId={currentUserId ?? undefined}
+          />
+        )}
       </div>
     </main>
   );

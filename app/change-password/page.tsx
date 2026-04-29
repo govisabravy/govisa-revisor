@@ -35,7 +35,8 @@ export default function ChangePasswordPage() {
         setErr(data.error ?? "Erro");
         return;
       }
-      router.replace("/app");
+      const role = data.role;
+      router.replace(role === "admin" ? "/admin" : "/app");
     } catch {
       setErr("Erro de rede");
     } finally {
