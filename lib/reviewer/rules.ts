@@ -343,15 +343,18 @@ function applyLevel1PerForm(
   if (editionState === "outdated") {
     const accepted = CURRENT_USCIS_EDITIONS[formName] ?? [];
     out.push({
-      severity: "alta",
+      // Ajuste (Flavia 29/04): rebaixado de alta para media. Casos reais
+      // mostraram extração da edition_date com ruído ou edições antigas
+      // ainda aceitas pela USCIS. Time confere antes de tratar como bloqueante.
+      severity: "media",
       tier: "tier1_filing",
       category: "regra_govisa",
       field: `${formName} — Edition Date`,
       form: formName,
       expected: `Edição vigente USCIS (${accepted.join(" ou ")})`,
       found: editionDate ?? "(vazio)",
-      explanation: `Edição do ${formName} (${editionDate}) é anterior a 2024 — provavelmente obsoleta. USCIS rejeita formulários em edição desatualizada.`,
-      recommendation: `Substituir pelo ${formName} edição vigente (download em uscis.gov/${formName.toLowerCase()}).`,
+      explanation: `Edição do ${formName} (${editionDate}) é anterior a 2024 — verificar se ainda é aceita pela USCIS.`,
+      recommendation: `Conferir em uscis.gov/${formName.toLowerCase()} se a edição (${editionDate}) ainda é aceita; se não, substituir pela vigente.`,
       rule_id: RULE_IDS.DOC_EDITION_OUTDATED,
       subject_id: sid
     });
@@ -1315,12 +1318,16 @@ function applyLevel4Global(args: {
         });
         if (!inFm && !inI914A) {
           out.push({
-            severity: "alta",
+            // Ajuste (Flavia 29/04): filhos cidadãos americanos ou que não
+            // estejam em solo americano podem ser citados na história sem
+            // constar nos formulários (não precisam de I-914A). Rebaixado
+            // para media e mensagem orienta a equipe a confirmar.
+            severity: "media",
             tier: "tier2_substantivo",
             category: "credibilidade",
             field: `Filho na história sem entrada no I-914 — ${child.name}`,
             form: null,
-            explanation: `${child.name} aparece na história mas não tem entrada correspondente em family_members_included nem I-914A.`,
+            explanation: `${child.name} aparece na história mas não tem entrada correspondente em family_members_included nem I-914A. Se for cidadão americano ou não estiver em solo americano, o I-914A não é necessário: marcar como falso positivo.`,
             rule_id: RULE_IDS.T_CONS_CHILD_NAME_VS_I914A,
             subject_id: principalSubject?.id ?? null
           });
@@ -1585,14 +1592,17 @@ function applyLevel4Global(args: {
         const principalYear = principalDob.match(/\d{4}/)?.[0];
         if (year && principalYear) {
           const ageDiff = Number(principalYear) - Number(year);
-          if (a.relationship_to_principal && /child/i.test(a.relationship_to_principal) && ageDiff < 10) {
+          // Ajuste (Flavia 29/04): mães jovens são comuns; threshold mais
+          // conservador (< 7 anos) e severidade rebaixada para baixa pra
+          // funcionar como observação, não bloqueio.
+          if (a.relationship_to_principal && /child/i.test(a.relationship_to_principal) && ageDiff < 7) {
             out.push({
-              severity: "media",
+              severity: "baixa",
               tier: "tier2_substantivo",
               category: "elegibilidade",
               field: "I-914A — Qualifying relationship (idade)",
               form: "I-914A",
-              explanation: `I-914A marcado como filho mas diferença de idade com o principal é pequena (${ageDiff} anos). Verificar relacionamento.`,
+              explanation: `I-914A marcado como filho mas diferença de idade com o principal é pequena (${ageDiff} anos). Confirmar relacionamento.`,
               rule_id: RULE_IDS.T_DEP_FAMILY_MEMBER_REL_DIFF_AGE_SUSPICIOUS,
               subject_id: sid
             });
@@ -1601,13 +1611,17 @@ function applyLevel4Global(args: {
       }
       if (!a.relationship_evidence_mentioned || a.relationship_evidence_mentioned.length === 0) {
         out.push({
-          severity: "alta",
+          // Ajuste (Flavia 29/04): a evidência (certidão de nascimento ou
+          // casamento) costuma estar na seção "Identification Documents" do
+          // processo, não vinculada explicitamente ao I-914A. Rebaixado para
+          // media e mensagem pede que o time confirme manualmente.
+          severity: "media",
           tier: "tier1_filing",
           category: "suporte_documental",
           field: "I-914A — Evidência da relação",
           form: "I-914A",
           explanation:
-            "I-914A deve ser acompanhado de evidência do qualifying relationship (certidão de nascimento/casamento).",
+            "Não foi possível identificar evidência do qualifying relationship vinculada a este I-914A. Confirmar se a certidão de nascimento ou casamento está em Identification Documents do processo.",
           rule_id: RULE_IDS.T_DEP_I914A_NO_EVIDENCE,
           subject_id: sid
         });
