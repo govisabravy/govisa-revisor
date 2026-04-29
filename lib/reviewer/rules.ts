@@ -389,7 +389,7 @@ function applyLevel1PerForm(
         });
       } else if (proof && proof.found && proof.holder_match !== "principal") {
         out.push({
-          severity: "media",
+          severity: "baixa",
           tier: "tier1_filing",
           category: "regra_govisa",
           field: "Physical Address",
@@ -406,7 +406,7 @@ function applyLevel1PerForm(
         });
       } else {
         out.push({
-          severity: "media",
+          severity: "baixa",
           tier: "tier1_filing",
           category: "regra_govisa",
           field: "Physical Address",
@@ -485,15 +485,21 @@ function applyLevel1PerForm(
   }
 
   // Person — campos vazios
+  // Ajuste (Flavia 29/04): nem todo form tem campo de Passport ou SSN.
+  // Só rodamos esses checks nos forms que de fato exibem o campo no PDF do USCIS.
+  const FORMS_WITH_PASSPORT_FIELD = new Set(["I-914", "I-914A", "I-192", "I-918", "I-918A", "I-360"]);
+  const FORMS_WITH_SSN_FIELD = new Set(["I-914", "I-914A", "I-765", "I-918", "I-918A", "I-360"]);
   if ("person" in f && f.person) {
     const p = f.person;
     const checks: Array<[string, string | null | undefined, "alta" | "media", string]> = [
       ["Family Name", p.family_name, "alta", RULE_IDS.T_FILING_PERSON_FAMILY_NAME_EMPTY],
       ["Given Name", p.given_name, "alta", RULE_IDS.T_FILING_PERSON_GIVEN_NAME_EMPTY],
       ["Date of Birth", p.date_of_birth, "alta", RULE_IDS.T_FILING_PERSON_DOB_EMPTY],
-      ["Country of Birth", p.country_of_birth, "media", RULE_IDS.T_FILING_PERSON_BIRTH_COUNTRY_EMPTY],
-      ["Passport Number", p.passport_number, "media", RULE_IDS.T_FILING_PERSON_PASSPORT_EMPTY]
+      ["Country of Birth", p.country_of_birth, "media", RULE_IDS.T_FILING_PERSON_BIRTH_COUNTRY_EMPTY]
     ];
+    if (FORMS_WITH_PASSPORT_FIELD.has(f.form)) {
+      checks.push(["Passport Number", p.passport_number, "media", RULE_IDS.T_FILING_PERSON_PASSPORT_EMPTY]);
+    }
     for (const [label, value, sev, rid] of checks) {
       if (!value) {
         out.push({
@@ -508,7 +514,10 @@ function applyLevel1PerForm(
         });
       }
     }
-    if (p.ssn === null || p.ssn === undefined || p.ssn === "") {
+    if (
+      FORMS_WITH_SSN_FIELD.has(f.form) &&
+      (p.ssn === null || p.ssn === undefined || p.ssn === "")
+    ) {
       out.push({
         severity: "baixa",
         tier: "tier1_filing",
@@ -1039,17 +1048,27 @@ function applyLevel4Global(args: {
       const i765Name = `${i765.person.given_name ?? ""} ${i765.person.family_name ?? ""}`.trim();
       // Convenção brasileira: subset de tokens de nome conta como mesma pessoa.
       const forPrincipal = namesPlausiblyEqual(i765Name, principalName);
+      // Ajuste (Flavia 29/04): dependentes têm I-765 próprio. Se o I-765 está marcado
+      // como do principal mas o nome bate com algum I-914A, é mais provável que seja
+      // o I-765 do dependente etiquetado errado pelo extractor — não tratar como
+      // alta severidade. Só dispara quando o nome não bate com NINGUÉM do caso.
       if (i765.is_for_principal === true && !forPrincipal) {
-        out.push({
-          severity: "alta",
-          tier: "tier3_estrategico",
-          category: "estrategia",
-          field: "I-765 — Destinatário",
-          form: "I-765",
-          explanation: `I-765 marcado como do principal mas o nome (${i765Name}) não bate com I-914 (${principalName}). Verificar se é I-765 de um derivativo.`,
-          rule_id: RULE_IDS.T_FILING_I765_NAME_DIVERGES,
-          subject_id: sid
+        const matchesAnyDependent = i914a.some((dep) => {
+          const depName = `${dep.family_member?.given_name ?? ""} ${dep.family_member?.family_name ?? ""}`.trim();
+          return depName ? namesPlausiblyEqual(i765Name, depName) : false;
         });
+        if (!matchesAnyDependent) {
+          out.push({
+            severity: "alta",
+            tier: "tier3_estrategico",
+            category: "estrategia",
+            field: "I-765 — Destinatário",
+            form: "I-765",
+            explanation: `I-765 marcado como do principal mas o nome (${i765Name}) não bate com I-914 (${principalName}) nem com nenhum I-914A do caso.`,
+            rule_id: RULE_IDS.T_FILING_I765_NAME_DIVERGES,
+            subject_id: sid
+          });
+        }
       }
     }
   }
@@ -1149,21 +1168,24 @@ function applyLevel4Global(args: {
       }
     }
 
+    // Ajuste (Flavia 29/04): só dispara quando a história afirma cônjuge mas o
+    // formulário diz solteiro. O caso oposto (form casado, história sem citar
+    // esposo) NÃO é divergência: a história não precisa nomear o cônjuge.
     const storyHasSpouse =
       !!story.spouse_name || normalizeMarital(story.marital_status) === "casado";
     const formHasSpouse = normalizeMarital(reference.marital_status) === "casado";
-    if (storyHasSpouse !== formHasSpouse) {
+    if (storyHasSpouse && !formHasSpouse) {
       out.push({
         severity: "critica",
         tier: "tier2_substantivo",
         category: "credibilidade",
         field: "Marital Status (cônjuge)",
         form: "I-914",
-        expected: storyHasSpouse ? "casado (história menciona cônjuge)" : "sem cônjuge na história",
-        found: formHasSpouse ? "casado (formulário)" : "não casado (formulário)",
+        expected: "casado (história menciona cônjuge)",
+        found: "não casado (formulário)",
         source: "história vs formulário",
         explanation:
-          "Inconsistência entre cônjuge mencionado na história e estado civil no formulário.",
+          "História menciona cônjuge mas o formulário marca o cliente como não casado.",
         rule_id: RULE_IDS.T_CONS_SPOUSE_FLAG_DIVERGE,
         subject_id: principalSubject?.id ?? null
       });
@@ -1181,18 +1203,36 @@ function applyLevel4Global(args: {
         return true;
       });
 
-      if (qualifyingChildren.length > i914a.length) {
+      // Ajuste (Flavia 29/04): filhos cidadãos americanos não precisam de I-914A
+      // (eles já têm status próprio). Descontamos os filhos marcados como USC
+      // em family_members_included antes de comparar.
+      const usCitizenChildNames = new Set(
+        (i914?.family_members_included ?? [])
+          .filter((fm) => fm.is_us_citizen === true)
+          .map((fm) => (fm.name ?? "").trim().toLowerCase())
+          .filter((n) => n.length > 0)
+      );
+      const qualifyingNonUsc = qualifyingChildren.filter((c) => {
+        const name = (c.name ?? "").trim().toLowerCase();
+        if (!name) return true;
+        for (const usc of usCitizenChildNames) {
+          if (namesPlausiblyEqual(name, usc)) return false;
+        }
+        return true;
+      });
+
+      if (qualifyingNonUsc.length > i914a.length) {
         out.push({
-          severity: "alta",
+          severity: "media",
           tier: "tier2_substantivo",
           category: "elegibilidade",
           field: "Dependentes (I-914A)",
           form: "I-914A",
-          expected: `${qualifyingChildren.length} filho(s) qualificado(s) (solteiro, < 21 anos no filing) na história`,
+          expected: `${qualifyingNonUsc.length} filho(s) qualificado(s) (solteiro, < 21 anos no filing, não cidadão americano) na história`,
           found: `${i914a.length} I-914A no processo`,
           source: "história vs I-914A",
           explanation:
-            "Principal adulto pode incluir como derivativos apenas filhos SOLTEIROS MENORES DE 21 NO FILING (CSPA age-out protection). Há filhos qualificados na história sem I-914A correspondente.",
+            "Principal adulto pode incluir como derivativos apenas filhos SOLTEIROS MENORES DE 21 NO FILING (CSPA age-out protection). Há filhos qualificados na história sem I-914A correspondente. Se algum desses filhos for cidadão americano ou não estiver em solo americano, não precisa de I-914A: marcar este finding como falso positivo.",
           rule_id: RULE_IDS.T_DEP_QUALIFYING_CHILD_NO_I914A,
           subject_id: principalSubject?.id ?? null
         });
@@ -1705,12 +1745,26 @@ function applyLevel4Global(args: {
         "alta",
         true
       );
-      // Country of birth — passaporte traz "Place of Birth" que pode incluir cidade
-      // Usar subset de tokens pra ser tolerante (ex: "RIO DE JANEIRO, BRAZIL" inclui "BRAZIL")
+      // Country of birth — passaporte traz "Place of Birth" que pode incluir cidade,
+      // estado e país numa string só. O formulário separa em campos distintos
+      // (cidade, estado, país). Ajuste (Flavia 29/04): comparamos por overlap
+      // de tokens, considerando coerente quando QUALQUER token relevante
+      // (>= 3 letras) do form aparece no place_of_birth do passaporte (ou vice-versa).
       if (check.place_of_birth_seen && personOfSubject.country_of_birth) {
         const placeNorm = norm(check.place_of_birth_seen);
         const countryNorm = norm(personOfSubject.country_of_birth);
-        if (!placeNorm.includes(countryNorm) && !countryNorm.includes(placeNorm)) {
+        const tokenize = (s: string) =>
+          s
+            .split(/[\s,;./-]+/)
+            .map((t) => t.trim())
+            .filter((t) => t.length >= 3);
+        const placeTokens = new Set(tokenize(placeNorm));
+        const formTokens = tokenize(countryNorm);
+        const overlap =
+          placeNorm.includes(countryNorm) ||
+          countryNorm.includes(placeNorm) ||
+          formTokens.some((t) => placeTokens.has(t));
+        if (!overlap) {
           out.push({
             severity: "media",
             tier: "tier1_filing",
