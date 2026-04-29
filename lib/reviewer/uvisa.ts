@@ -193,15 +193,71 @@ export interface UVisaRulesInput {
   story: UVisaStoryFacts | null;
   /** Opcional — quando presente, regras de waiver podem rebaixar severidade. */
   i192?: I192Form | null;
+  /**
+   * Texto bruto agregado dos documentos do processo (subdocs.text concatenado).
+   * Usado para deteccao heuristica de waiver petition e cartas de imigracao
+   * (NTA, I-220A, I-862, EOIR) — Parte 6 do feedback Flavia 29/04.
+   */
+  fullText?: string | null;
 }
 
 function norm(v?: string | null): string {
   return (v ?? "").toString().trim().toUpperCase().replace(/\s+/g, " ");
 }
 
+// Heuristica de waiver petition I-918 Supplement B: procura mencao explicita a
+// waiver/exception no texto agregado. Util quando o I-918B nao vem assinado pelo
+// certifying officer (~90% dos casos, segundo Flavia) mas ha justificativa.
+function detectsI918BWaiverPetition(fullText: string | null | undefined, i918: I918Form | null): boolean {
+  if (i918?.inadmissibility_requires_waiver === true) return true;
+  if (!fullText) return false;
+  const t = fullText.toLowerCase();
+  // Mencao explicita a "I-918 Supplement B Waiver" / waiver da certificacao /
+  // exception request / certifying agency declined / unable to obtain certification.
+  const PATTERNS = [
+    /i[-\s]?918\s*(?:supplement\s*)?b\s*(?:certification\s*)?waiver/i,
+    /supplement\s*b\s*waiver/i,
+    /waiver\s*(?:of|for)\s*(?:the\s*)?(?:i[-\s]?918\s*b|certification)/i,
+    /(?:certification|certifying)\s*(?:agency|official)\s*(?:declined|refused|unable|did\s*not\s*respond)/i,
+    /unable\s*to\s*obtain\s*(?:the\s*)?(?:i[-\s]?918\s*b|certification|supplement\s*b)/i,
+    /exception\s*request/i,
+    /non[-\s]?cooperation\s*waiver/i
+  ];
+  return PATTERNS.some((rx) => rx.test(t));
+}
+
+// Heuristica: detecta presenca de carta de imigracao oficial (NTA, I-220A,
+// I-862, ordem de remocao) no texto agregado do processo.
+function hasImmigrationLetter(fullText: string | null | undefined): boolean {
+  if (!fullText) return false;
+  const t = fullText.toLowerCase();
+  const PATTERNS = [
+    /\bnotice\s*to\s*appear\b/i,
+    /\bnta\b/i,
+    /\bi[-\s]?220\s*a\b/i,
+    /\bi[-\s]?862\b/i,
+    /\border\s*of\s*removal\b/i,
+    /\border\s*to\s*show\s*cause\b/i,
+    /\bimmigration\s*court\b/i,
+    /\beoir\b/i,
+    /\bexecutive\s*office\s*for\s*immigration\s*review\b/i,
+    /\bdepartment\s*of\s*homeland\s*security\b/i,
+    /\bice\s*(?:detainer|hold|notice|custody|enforcement)\b/i,
+    /\bimmigration\s*(?:judge|hearing|proceeding)\b/i,
+    /\bremoval\s*proceeding/i,
+    /\bcustody\s*notice\b/i
+  ];
+  return PATTERNS.some((rx) => rx.test(t));
+}
+
+function ageAtDateLocalU2(dob?: string | null, at: Date = new Date()): number | null {
+  return ageAtDateLocalU(dob, at);
+}
+
 export function applyUVisaRules(args: UVisaRulesInput): Finding[] {
   const out: Finding[] = [];
-  const { i918, i918as, i918b, story, i192 } = args;
+  const { i918, i918as, i918b, story, i192, fullText } = args;
+  const waiverPresent = detectsI918BWaiverPetition(fullText, i918);
 
   if (!i918) {
     out.push({
@@ -255,13 +311,33 @@ export function applyUVisaRules(args: UVisaRulesInput): Finding[] {
       });
     }
     if (!i918b.signature?.signed) {
-      out.push({
-        severity: "critica", tier: "tier1_filing", category: "assinatura",
-        field: "I-918B — Assinatura do Certifying Official", form: "I-918B",
-        explanation: "I-918B precisa estar assinado pelo oficial certificador.",
-        rule_id: RULE_IDS.U_FILING_I918B_NOT_SIGNED,
-        subject_id: null
-      });
+      // Ajuste Parte 6 Flavia (29/04): cerca de 90% dos casos vem com I-918B
+      // sem assinatura, e na pratica o filing inclui waiver petition justificando
+      // a ausencia. Se detectarmos waiver explicito (no I-918 ou texto agregado),
+      // rebaixamos pra media e reformulamos a mensagem; senao, mantemos critica.
+      if (waiverPresent) {
+        out.push({
+          severity: "media", tier: "tier1_filing", category: "assinatura",
+          field: "I-918B — Assinatura do Certifying Official (com waiver detectado)", form: "I-918B",
+          explanation:
+            "I-918B nao esta assinado pelo certifying official, porem foi identificada mencao a waiver petition / exception request (I-918 Supplement B Waiver) no processo. Confirmar que a waiver petition esta completa, que ha justificativa robusta de impossibilidade de obter a certificacao e que ha secondary evidence de helpfulness.",
+          recommendation:
+            "Validar manualmente: (1) waiver petition foi anexada e assinada pelo cliente; (2) ha narrativa explicando porque o LEA nao certificou; (3) helpfulness substituida por declaracoes de testemunhas, BO, registros policiais, news reports.",
+          rule_id: RULE_IDS.U_FILING_I918B_NOT_SIGNED,
+          subject_id: null
+        });
+      } else {
+        out.push({
+          severity: "critica", tier: "tier1_filing", category: "assinatura",
+          field: "I-918B — Assinatura do Certifying Official", form: "I-918B",
+          explanation:
+            "I-918B precisa estar assinado pelo oficial certificador. Nao foi detectada waiver petition / I-918 Supplement B Waiver no processo. Cerca de 90% dos casos vem sem assinatura — antes de fechar como critica, confirmar manualmente se ha waiver/exception request anexada que o sistema nao conseguiu identificar.",
+          recommendation:
+            "Obter assinatura do certifying official. Caso a agencia nao certifique, anexar waiver petition (I-918 Supplement B Waiver) com narrativa de impossibilidade + secondary evidence de helpfulness.",
+          rule_id: RULE_IDS.U_FILING_I918B_NOT_SIGNED,
+          subject_id: null
+        });
+      }
     }
     if (!i918b.certifying_official_title) {
       out.push({
@@ -440,13 +516,102 @@ export function applyUVisaRules(args: UVisaRulesInput): Finding[] {
         });
       }
       if (!a.relationship_evidence_mentioned || a.relationship_evidence_mentioned.length === 0) {
+        // Ajuste Parte 6 Flavia (29/04): a evidencia (certidao de nascimento/
+        // casamento) costuma estar em Identification Documents do processo,
+        // nao vinculada explicitamente ao I-918A. Rebaixado para media com
+        // mensagem pedindo verificacao manual — espelha T-visa.
         out.push({
-          severity: "alta", tier: "tier1_filing", category: "suporte_documental",
+          severity: "media", tier: "tier1_filing", category: "suporte_documental",
           field: "I-918A — Evidência da relação", form: "I-918A",
           explanation:
-            "I-918A deve ser acompanhado de evidência do qualifying relationship (certidão de nascimento/casamento).",
+            "Nao foi possivel identificar evidencia do qualifying relationship vinculada a este I-918A. Confirmar se a certidao de nascimento ou casamento esta em Identification Documents do processo.",
           rule_id: RULE_IDS.U_DEP_I918A_NO_EVIDENCE,
           subject_id: sid
+        });
+      }
+    }
+  }
+
+  // Parte 6 (Flavia) — qualifying relatives mencionados no I-918 / story sem I-918A
+  // Espelha o padrao do T-visa: tolerancia para USC e familiares fora dos EUA.
+  if (i918) {
+    const filingDateForDeps = parseDate(i918.meta?.applicant_signature?.date_signed) ?? new Date();
+    const principalAge = ageAtDateLocalU2(i918.person?.date_of_birth, filingDateForDeps);
+    const principalIsMinor = principalAge !== null && principalAge < 21;
+
+    const matchesAnyI918A = (name?: string | null, dob?: string | null): boolean => {
+      if (!name && !dob) return false;
+      const targetFirst = norm((name ?? "").split(" ")[0]);
+      const targetLast = norm((name ?? "").split(" ").slice(-1)[0]);
+      return i918as.some((a) => {
+        const fm = a.family_member;
+        if (!fm) return false;
+        const aFirst = norm(fm.given_name ?? "");
+        const aLast = norm(fm.family_name ?? "");
+        const aDob = (fm.date_of_birth ?? "").slice(0, 10);
+        const dobMatch = !!dob && !!aDob && aDob === (dob ?? "").slice(0, 10);
+        const nameMatch =
+          (!!targetFirst && (aFirst === targetFirst || aLast === targetFirst)) ||
+          (!!targetLast && (aFirst === targetLast || aLast === targetLast));
+        return nameMatch || dobMatch;
+      });
+    };
+
+    for (const fm of i918.family_members_included ?? []) {
+      const rel = (fm.relationship ?? "").toLowerCase();
+      const isSpouse = /spouse|c[ôo]njuge|wife|husband|esposa|marido/.test(rel);
+      const isChild = /child|son|daughter|filho|filha/.test(rel);
+      const isParent = /parent|pai|m[ãa]e|mother|father/.test(rel);
+      const isSibling = /sibling|brother|sister|irm[ãa]o|irm[ãa]/.test(rel);
+      const fmAge = ageAtDateLocalU2(fm.date_of_birth, filingDateForDeps);
+
+      // U-visa qualifying derivatives:
+      // - Spouse (T-2) sempre qualifica
+      // - Child (T-3) < 21 e nao casado
+      // - Se principal < 21: parent (T-4) e unmarried sibling < 18 (T-5)
+      let qualifies = false;
+      if (isSpouse) qualifies = true;
+      else if (isChild && fmAge !== null && fmAge < 21) qualifies = true;
+      else if (principalIsMinor && isParent) qualifies = true;
+      else if (principalIsMinor && isSibling && fmAge !== null && fmAge < 18) qualifies = true;
+
+      if (!qualifies) continue;
+
+      const isUsCitizen = fm.is_us_citizen === true;
+      const residesAbroad =
+        !!fm.country_of_residence &&
+        norm(fm.country_of_residence) !== "US" &&
+        norm(fm.country_of_residence) !== "USA" &&
+        norm(fm.country_of_residence) !== "UNITED STATES";
+
+      if (matchesAnyI918A(fm.name, fm.date_of_birth)) continue;
+
+      if (isUsCitizen) {
+        out.push({
+          severity: "baixa", tier: "tier3_estrategico", category: "estrategia",
+          field: `${fm.name ?? "Familiar"} — USC, sem I-918A`, form: null,
+          explanation:
+            "Familiar marcado como cidadao americano — nao precisa de I-918A. Correto nao incluir.",
+          rule_id: RULE_IDS.U_DEP_USC_NO_I918A_OK,
+          subject_id: null
+        });
+      } else if (residesAbroad) {
+        out.push({
+          severity: "baixa", tier: "tier3_estrategico", category: "estrategia",
+          field: `${fm.name ?? "Familiar"} — reside fora dos EUA, sem I-918A`, form: null,
+          explanation: `Familiar reside em ${fm.country_of_residence}. I-918A pode ser apresentado para consular processing posterior — nao bloqueia o filing do principal.`,
+          rule_id: RULE_IDS.U_DEP_ABROAD_CONSULAR_OK,
+          subject_id: null
+        });
+      } else {
+        out.push({
+          severity: "alta", tier: "tier2_substantivo", category: "elegibilidade",
+          field: `I-918A faltando — ${fm.name ?? "familiar"}`, form: "I-918A",
+          explanation: `${fm.name ?? "Familiar"} (${rel || "relacao"}, ${fmAge !== null ? fmAge + " anos no filing" : "idade desconhecida"}) qualifica como U-derivativo mas nao tem I-918A no processo.`,
+          recommendation:
+            "Anexar I-918A para o derivativo (com evidencia do qualifying relationship). Se for USC ou residir fora dos EUA, declarar explicitamente para evitar este flag.",
+          rule_id: RULE_IDS.U_DEP_QUALIFYING_RELATIVE_NO_I918A,
+          subject_id: null
         });
       }
     }
@@ -509,6 +674,29 @@ export function applyUVisaRules(args: UVisaRulesInput): Finding[] {
         recommendation:
           "Confirmar com cliente registro como votante, declaração de cidadania em I-9, social security ou passport application. Avaliar timely retraction ou idade < 18 ao fazer a declaração.",
         rule_id: RULE_IDS.U_SUBST_FALSE_CLAIM_RISK,
+        subject_id: null
+      });
+    }
+  }
+
+  // Parte 6 (Flavia) — A-number presente sem carta de imigracao detectada
+  // Quando o cliente tem A-number em algum form mas o processo nao traz
+  // NTA / I-220A / I-862 / Order of Removal / mencao a EOIR/ICE, pode
+  // significar que existe historico junto a EOIR nao trazido pelo cliente.
+  // Acao: cruzar com sistema EOIR antes do filing.
+  {
+    const aNumber = i918?.person?.a_number ?? null;
+    const hasANumber = !!(aNumber && aNumber.replace(/\D/g, "").length >= 7);
+    if (hasANumber && !hasImmigrationLetter(fullText)) {
+      out.push({
+        severity: "media", tier: "tier2_substantivo", category: "suporte_documental",
+        field: "A-number presente sem carta de imigração no processo", form: "I-918",
+        found: aNumber,
+        explanation:
+          "Cliente possui A-number preenchido no I-918 mas nao foi detectada carta de imigracao oficial (Notice to Appear, I-220A, I-862, Order of Removal, ou referencia a Immigration Court / EOIR / ICE) entre os documentos do processo.",
+        recommendation:
+          "Consultar se esta presente carta de imigracao na parte dos documentos para cruzamento de dados. Nao havendo, consultar o sistema EOIR (https://acis.eoir.justice.gov/en/) para verificar processos abertos antes do filing.",
+        rule_id: RULE_IDS.IMM_EWI_A_NUMBER_NO_IMMIGRATION_DOC,
         subject_id: null
       });
     }

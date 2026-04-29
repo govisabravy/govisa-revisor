@@ -150,11 +150,40 @@ ${args.text.slice(0, 20000)}
 export interface VawaRulesInput {
   i360: I360Form | null;
   story: VawaStoryFacts | null;
+  /**
+   * Texto bruto agregado dos documentos do processo (subdocs.text concatenado).
+   * Usado para deteccao heuristica de cartas de imigracao (NTA, I-220A, I-862,
+   * EOIR) — Parte 6 do feedback Flavia 29/04.
+   */
+  fullText?: string | null;
+}
+
+// Heuristica: detecta presenca de carta de imigracao oficial no texto agregado.
+function hasImmigrationLetterV(fullText: string | null | undefined): boolean {
+  if (!fullText) return false;
+  const t = fullText.toLowerCase();
+  const PATTERNS = [
+    /\bnotice\s*to\s*appear\b/i,
+    /\bnta\b/i,
+    /\bi[-\s]?220\s*a\b/i,
+    /\bi[-\s]?862\b/i,
+    /\border\s*of\s*removal\b/i,
+    /\border\s*to\s*show\s*cause\b/i,
+    /\bimmigration\s*court\b/i,
+    /\beoir\b/i,
+    /\bexecutive\s*office\s*for\s*immigration\s*review\b/i,
+    /\bdepartment\s*of\s*homeland\s*security\b/i,
+    /\bice\s*(?:detainer|hold|notice|custody|enforcement)\b/i,
+    /\bimmigration\s*(?:judge|hearing|proceeding)\b/i,
+    /\bremoval\s*proceeding/i,
+    /\bcustody\s*notice\b/i
+  ];
+  return PATTERNS.some((rx) => rx.test(t));
 }
 
 export function applyVawaRules(args: VawaRulesInput): Finding[] {
   const out: Finding[] = [];
-  const { i360, story } = args;
+  const { i360, story, fullText } = args;
 
   if (!i360) {
     out.push({
@@ -406,6 +435,27 @@ export function applyVawaRules(args: VawaRulesInput): Finding[] {
           });
         }
       }
+    }
+  }
+
+  // Parte 6 (Flavia) — A-number presente sem carta de imigracao detectada (VAWA)
+  // Mesma logica do U-visa: cliente com A-number mas sem NTA / I-220A / I-862 /
+  // referencia a EOIR/ICE no processo deve disparar verificacao manual via EOIR.
+  {
+    const aNumber = i360.person?.a_number ?? null;
+    const hasANumber = !!(aNumber && aNumber.replace(/\D/g, "").length >= 7);
+    if (hasANumber && !hasImmigrationLetterV(fullText)) {
+      out.push({
+        severity: "media", tier: "tier2_substantivo", category: "suporte_documental",
+        field: "A-number presente sem carta de imigração no processo", form: "I-360",
+        found: aNumber,
+        explanation:
+          "Cliente possui A-number preenchido no I-360 mas nao foi detectada carta de imigracao oficial (Notice to Appear, I-220A, I-862, Order of Removal, ou referencia a Immigration Court / EOIR / ICE) entre os documentos do processo.",
+        recommendation:
+          "Consultar se esta presente carta de imigracao na parte dos documentos para cruzamento de dados. Nao havendo, consultar o sistema EOIR (https://acis.eoir.justice.gov/en/) para verificar processos abertos antes do filing.",
+        rule_id: RULE_IDS.IMM_EWI_A_NUMBER_NO_IMMIGRATION_DOC,
+        subject_id: null
+      });
     }
   }
 

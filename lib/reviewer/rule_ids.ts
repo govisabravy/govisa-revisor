@@ -126,6 +126,10 @@ export const RULE_IDS = {
   U_DEP_I918A_PRINCIPAL_NAME_DIVERGE: "U_DEP_I918A_PRINCIPAL_NAME_DIVERGE",
   U_DEP_I918A_NO_QUALIFYING_REL: "U_DEP_I918A_NO_QUALIFYING_REL",
   U_DEP_I918A_NO_EVIDENCE: "U_DEP_I918A_NO_EVIDENCE",
+  // Cliente cita dependente qualificante na I-918 (ou story) sem I-918A correspondente.
+  U_DEP_QUALIFYING_RELATIVE_NO_I918A: "U_DEP_QUALIFYING_RELATIVE_NO_I918A",
+  U_DEP_USC_NO_I918A_OK: "U_DEP_USC_NO_I918A_OK",
+  U_DEP_ABROAD_CONSULAR_OK: "U_DEP_ABROAD_CONSULAR_OK",
 
   // ----- VAWA -----
   V_FILING_I360_MISSING: "V_FILING_I360_MISSING",
@@ -168,7 +172,13 @@ export const RULE_IDS = {
   // ----- Q14 — Prior false claim to U.S. citizenship -----
   T_SUBST_FALSE_CLAIM_RISK: "T_SUBST_FALSE_CLAIM_RISK",
   U_SUBST_FALSE_CLAIM_RISK: "U_SUBST_FALSE_CLAIM_RISK",
-  V_SUBST_FALSE_CLAIM_RISK: "V_SUBST_FALSE_CLAIM_RISK"
+  V_SUBST_FALSE_CLAIM_RISK: "V_SUBST_FALSE_CLAIM_RISK",
+
+  // ----- Parte 6 (Flavia) — A-number sem carta de imigração -----
+  // Cliente VAWA/U-visa tem A-number preenchido em algum form mas nao foi
+  // detectada carta de imigração entre os documentos. Sinaliza pra cruzar
+  // com EOIR antes do filing.
+  IMM_EWI_A_NUMBER_NO_IMMIGRATION_DOC: "IMM_EWI_A_NUMBER_NO_IMMIGRATION_DOC"
 } as const;
 
 export type RuleId = keyof typeof RULE_IDS;

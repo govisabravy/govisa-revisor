@@ -687,7 +687,9 @@ export async function reviewProcess(input: ReviewInput): Promise<ReviewOutput> {
     const g = i914?.person?.given_name ?? storyT?.full_name ?? null;
     clientName = g ? `${g} ${i914?.person?.family_name ?? ""}`.trim() : null;
   } else if (caseType === "vawa") {
-    findings = applyVawaRules({ i360, story: storyVawa });
+    // Parte 6 (Flavia): texto agregado para deteccao heuristica de cartas de imigracao.
+    const fullText = pdf.pages.join("\n\n");
+    findings = applyVawaRules({ i360, story: storyVawa, fullText });
     extractedForms = [i360, ...formsT].filter(Boolean);
     storyFacts = storyVawa;
     const g = i360?.person?.given_name ?? storyVawa?.full_name ?? null;
@@ -695,7 +697,10 @@ export async function reviewProcess(input: ReviewInput): Promise<ReviewOutput> {
   } else {
     // U-visa: passar i192 pra regra de waiver de não-cooperação (obs 4 da Flavia)
     const i192 = (formsT.find((f) => f.form === "I-192") as any) ?? null;
-    findings = applyUVisaRules({ i918, i918as, i918b, story: storyU, i192 });
+    // Parte 6 (Flavia): texto agregado para deteccao heuristica de waiver
+    // petition (I-918B) e cartas de imigracao (NTA, I-220A, EOIR, ICE).
+    const fullText = pdf.pages.join("\n\n");
+    findings = applyUVisaRules({ i918, i918as, i918b, story: storyU, i192, fullText });
     extractedForms = [i918, ...i918as, i918b, ...formsT].filter(Boolean);
     storyFacts = storyU;
     const g = i918?.person?.given_name ?? storyU?.full_name ?? null;
