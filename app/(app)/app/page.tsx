@@ -29,6 +29,18 @@ export default function NewReview() {
   const [mode, setMode] = useState<"draft" | "final">("draft");
   const [caseType, setCaseType] = useState<"t_visa"|"vawa"|"u_visa">("t_visa");
   const [recent, setRecent] = useState<Recent[]>([]);
+  const [abortCtrl, setAbortCtrl] = useState<AbortController | null>(null);
+  const [elapsed, setElapsed] = useState(0);
+
+  // Cronômetro durante revisão
+  useEffect(() => {
+    if (!loading) {
+      setElapsed(0);
+      return;
+    }
+    const t = setInterval(() => setElapsed((e) => e + 1), 1000);
+    return () => clearInterval(t);
+  }, [loading]);
 
   useEffect(() => {
     fetch("/api/reviews")
@@ -49,12 +61,18 @@ export default function NewReview() {
     setReport(null);
     setReviewId(null);
     setFileName(file.name);
+    const ctrl = new AbortController();
+    setAbortCtrl(ctrl);
     try {
       const fd = new FormData();
       fd.append("file", file);
       fd.append("mode", mode);
       fd.append("case_type", caseType);
-      const res = await fetch("/api/review", { method: "POST", body: fd });
+      const res = await fetch("/api/review", {
+        method: "POST",
+        body: fd,
+        signal: ctrl.signal
+      });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.error ?? `HTTP ${res.status}`);
@@ -81,10 +99,25 @@ export default function NewReview() {
         setReport(data.report);
       }
     } catch (err: any) {
-      setError(err?.message ?? "Erro ao revisar processo.");
+      if (err?.name === "AbortError") {
+        setError("Revisão interrompida pelo usuário.");
+      } else {
+        setError(err?.message ?? "Erro ao revisar processo.");
+      }
     } finally {
       setLoading(false);
+      setAbortCtrl(null);
     }
+  }
+
+  function cancelReview() {
+    if (abortCtrl) abortCtrl.abort();
+  }
+
+  function fmtElapsed(s: number) {
+    const m = Math.floor(s / 60);
+    const sec = s % 60;
+    return `${m}m${sec.toString().padStart(2, "0")}s`;
   }
 
   function reset() {
@@ -236,10 +269,26 @@ export default function NewReview() {
         )}
 
         {loading && (
-          <div className="bg-white rounded-2xl p-12 border border-slate-200 flex flex-col items-center justify-center">
-            <Loader2 className="w-10 h-10 text-govisa-navy animate-spin mb-3" />
-            <p className="text-slate-700 font-medium">Revisando {fileName}...</p>
-            <p className="text-sm text-slate-500 mt-1">Extração + análise com IA. Pode levar 1–2 minutos.</p>
+          <div className="bg-white rounded-2xl p-10 border border-slate-200 flex flex-col items-center justify-center">
+            <Loader2 className="w-10 h-10 text-govisa-navy animate-spin mb-4" />
+            <p className="text-slate-900 font-semibold text-base">
+              Revisando {fileName}
+            </p>
+            <p className="text-sm text-slate-600 mt-2 max-w-lg text-center">
+              Subimos uma <strong>IA mais capacitada</strong> (Opus 4.7 + análise sênior + adversarial pass + predição de RFE)
+              que pensa muito mais profundo sobre o caso. Por isso a revisão pode levar até{" "}
+              <strong>10 minutos</strong>, especialmente em PDFs grandes ou com vários dependentes.
+            </p>
+            <div className="mt-4 flex items-center gap-2 text-xs text-slate-500">
+              <Clock className="w-4 h-4" />
+              <span>Decorrido: {fmtElapsed(elapsed)}</span>
+            </div>
+            <button
+              onClick={cancelReview}
+              className="mt-6 px-4 py-2 text-sm font-medium text-red-700 bg-red-50 hover:bg-red-100 border border-red-300 rounded-lg transition"
+            >
+              Interromper revisão
+            </button>
           </div>
         )}
 

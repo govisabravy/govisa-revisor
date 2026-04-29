@@ -36,17 +36,26 @@ export const GOVISA_ADDRESS = {
  * Formato: MM/DD/YY (ou MM/DD/YYYY) — comparado normalizado.
  */
 export const CURRENT_USCIS_EDITIONS: Record<string, string[]> = {
-  "I-914":  ["09/30/24", "01/19/24"],
-  "I-914A": ["09/30/24", "01/19/24"],
-  "I-914B": ["09/30/24", "01/19/24"],
-  "I-918":  ["12/16/24", "06/12/24"],
-  "I-918A": ["12/16/24", "06/12/24"],
-  "I-918B": ["12/16/24", "06/12/24"],
-  "I-192":  ["10/15/24"],
-  "I-765":  ["04/01/24", "01/19/24"],
-  "G-28":   ["01/19/24"],
-  "I-360":  ["07/24/24", "01/19/24"]
+  "I-914":  ["01/20/25", "09/30/24", "01/19/24"],
+  "I-914A": ["01/20/25", "09/30/24", "01/19/24"],
+  "I-914B": ["01/20/25", "09/30/24", "01/19/24"],
+  "I-918":  ["01/20/25", "12/16/24", "06/12/24"],
+  "I-918A": ["01/20/25", "12/16/24", "06/12/24"],
+  "I-918B": ["01/20/25", "12/16/24", "06/12/24"],
+  "I-192":  ["01/20/25", "10/15/24"],
+  "I-765":  ["08/21/25", "04/01/24", "01/19/24"],
+  "G-28":   ["01/19/24", "05/05/22"],
+  "I-360":  ["01/20/25", "07/24/24", "01/19/24"]
 };
+
+/**
+ * Edições com data igual ou posterior a este threshold são consideradas
+ * potencialmente vigentes mesmo se NÃO estiverem na lista exata acima.
+ * Isso evita falso positivo quando o USCIS publica uma edição nova e a
+ * lista hardcoded ainda não foi atualizada. Atualizar este threshold
+ * conforme o tempo passa.
+ */
+const EDITION_MIN_ACCEPT_YEAR = 24; // YY: edições >= 01/01/24 não geram alerta forte
 
 /** Normaliza edição USCIS para MM/DD/YY (descartando século caso venha 4 dígitos). */
 function normEdition(s?: string | null): string | null {
@@ -60,15 +69,50 @@ function normEdition(s?: string | null): string | null {
   return `${mm}/${dd}/${yy}`;
 }
 
-/** True se `edition` está na lista de edições atuais (comparação normalizada). */
-function isCurrentEdition(formName: string, edition?: string | null): boolean | null {
+/** Extrai YY (ano em 2 dígitos) de uma edição normalizada MM/DD/YY. Retorna null se inválido. */
+function editionYear(normed: string): number | null {
+  const m = normed.match(/^\d{2}\/\d{2}\/(\d{2})$/);
+  if (!m) return null;
+  const yy = parseInt(m[1], 10);
+  return isNaN(yy) ? null : yy;
+}
+
+/**
+ * Veredito da edição:
+ * - "current" → está na lista exata do USCIS (sem alerta)
+ * - "likely_current" → ano >= threshold mas não está na lista (sem alerta forte;
+ *   pode ser edição nova publicada recentemente)
+ * - "outdated" → ano antes do threshold (alerta de edição obsoleta)
+ * - null → sem dado pra avaliar
+ */
+function editionStatus(
+  formName: string,
+  edition?: string | null
+): "current" | "likely_current" | "outdated" | null {
   const accepted = CURRENT_USCIS_EDITIONS[formName];
-  if (!accepted || accepted.length === 0) return null; // não temos lista p/ esse form
-  if (!edition) return null; // sem dado — não dispara aqui
+  if (!edition) return null;
   const normed = normEdition(edition);
   if (!normed) return null;
-  const set = new Set(accepted.map((e) => normEdition(e)).filter(Boolean) as string[]);
-  return set.has(normed);
+  if (accepted && accepted.length > 0) {
+    const set = new Set(accepted.map((e) => normEdition(e)).filter(Boolean) as string[]);
+    if (set.has(normed)) return "current";
+  }
+  const yy = editionYear(normed);
+  if (yy === null) return null;
+  // 2-digit year window: 00-50 vira 2000-2050; 51-99 vira 1951-1999
+  // (USCIS forms nunca terão edição 1900s relevante)
+  const fullYear = yy < 51 ? 2000 + yy : 1900 + yy;
+  if (fullYear >= 2000 + EDITION_MIN_ACCEPT_YEAR) {
+    return "likely_current";
+  }
+  return "outdated";
+}
+
+/** Compat: mantém a função original retornando boolean|null pra eventual uso externo. */
+function isCurrentEdition(formName: string, edition?: string | null): boolean | null {
+  const s = editionStatus(formName, edition);
+  if (s === null) return null;
+  return s === "current" || s === "likely_current";
 }
 
 function norm(v?: string | null): string {
@@ -291,9 +335,12 @@ function applyLevel1PerForm(
   const sid = subject?.id ?? null;
 
   // Q6 — Edição USCIS desatualizada (DOC_EDITION_OUTDATED, genérico p/ T/U/VAWA)
+  // Só dispara pra "outdated" (ano < 2024). "likely_current" (edição recente
+  // não listada explicitamente) NÃO gera alerta — minha lista hardcoded fica
+  // desatualizada e geraria falso positivo.
   const editionDate = (f as any)?.meta?.edition_date as string | null | undefined;
-  const editionOk = isCurrentEdition(formName, editionDate);
-  if (editionOk === false) {
+  const editionState = editionStatus(formName, editionDate);
+  if (editionState === "outdated") {
     const accepted = CURRENT_USCIS_EDITIONS[formName] ?? [];
     out.push({
       severity: "alta",
@@ -303,7 +350,7 @@ function applyLevel1PerForm(
       form: formName,
       expected: `Edição vigente USCIS (${accepted.join(" ou ")})`,
       found: editionDate ?? "(vazio)",
-      explanation: `Edição do ${formName} (${editionDate}) não consta na lista de edições vigentes do USCIS. USCIS rejeita formulários em edição desatualizada.`,
+      explanation: `Edição do ${formName} (${editionDate}) é anterior a 2024 — provavelmente obsoleta. USCIS rejeita formulários em edição desatualizada.`,
       recommendation: `Substituir pelo ${formName} edição vigente (download em uscis.gov/${formName.toLowerCase()}).`,
       rule_id: RULE_IDS.DOC_EDITION_OUTDATED,
       subject_id: sid
@@ -1680,24 +1727,161 @@ function applyLevel4Global(args: {
           });
         }
       }
-      // Nationality — passaporte usa códigos (BRA, USA), forms costumam usar nome completo
+      // Nationality — passaporte usa códigos (BRA, USA), gentílico (BRASILEIRO,
+      // AMERICAN), ou nome (Brasil, Brazil); forms também variam.
+      // Resolve cada lado pra um "país canônico" (ISO3) e compara.
       if (check.nationality_seen && personOfSubject.country_of_citizenship) {
         const natNorm = norm(check.nationality_seen);
         const formNorm = norm(personOfSubject.country_of_citizenship);
-        // Cobertura tolerante de códigos comuns
-        const codeMap: Record<string, string[]> = {
-          BRA: ["BRAZIL", "BRASIL", "BRAZILIAN"],
-          USA: ["UNITED STATES", "AMERICAN", "U.S.", "US"],
-          MEX: ["MEXICO", "MEXICAN"],
-          COL: ["COLOMBIA", "COLOMBIAN"],
-          VEN: ["VENEZUELA", "VENEZUELAN"]
+        // Catálogo: ISO3 → todos os tokens reconhecidos (ISO2, nome PT/EN,
+        // gentílico PT m/f, gentílico EN). Em caixa alta + sem acentos
+        // (norm já uppercase + trim, mas estes literais devem estar normalizados).
+        const COUNTRY_TOKENS: Record<string, string[]> = {
+          BRA: ["BR", "BRAZIL", "BRASIL", "BRAZILIAN", "BRASILEIRO", "BRASILEIRA"],
+          USA: [
+            "US",
+            "U.S.",
+            "U.S.A.",
+            "UNITED STATES",
+            "UNITED STATES OF AMERICA",
+            "AMERICAN",
+            "AMERICANO",
+            "AMERICANA",
+            "ESTADOUNIDENSE"
+          ],
+          MEX: ["MX", "MEXICO", "MÉXICO", "MEXICAN", "MEXICANO", "MEXICANA"],
+          COL: [
+            "CO",
+            "COLOMBIA",
+            "COLÔMBIA",
+            "COLOMBIAN",
+            "COLOMBIANO",
+            "COLOMBIANA"
+          ],
+          VEN: [
+            "VE",
+            "VENEZUELA",
+            "VENEZUELAN",
+            "VENEZUELANO",
+            "VENEZUELANA"
+          ],
+          ARG: [
+            "AR",
+            "ARGENTINA",
+            "ARGENTINIAN",
+            "ARGENTINE",
+            "ARGENTINO"
+          ],
+          PER: ["PE", "PERU", "PERÚ", "PERUVIAN", "PERUANO", "PERUANA"],
+          CHL: ["CL", "CHILE", "CHILEAN", "CHILENO", "CHILENA"],
+          ECU: [
+            "EC",
+            "ECUADOR",
+            "EQUADOR",
+            "ECUADORIAN",
+            "EQUATORIANO",
+            "ECUATORIANO"
+          ],
+          BOL: ["BO", "BOLIVIA", "BOLIVIAN", "BOLIVIANO", "BOLIVIANA"],
+          URY: ["UY", "URUGUAY", "URUGUAI", "URUGUAYAN", "URUGUAIO"],
+          PRY: [
+            "PY",
+            "PARAGUAY",
+            "PARAGUAI",
+            "PARAGUAYAN",
+            "PARAGUAIO"
+          ],
+          HND: [
+            "HN",
+            "HONDURAS",
+            "HONDURAN",
+            "HONDURENHO",
+            "HONDUREÑO"
+          ],
+          GTM: [
+            "GT",
+            "GUATEMALA",
+            "GUATEMALAN",
+            "GUATEMALTECO"
+          ],
+          SLV: [
+            "SV",
+            "EL SALVADOR",
+            "SALVADOREAN",
+            "SALVADORENHO",
+            "SALVADOREÑO"
+          ],
+          NIC: [
+            "NI",
+            "NICARAGUA",
+            "NICARAGUAN",
+            "NICARAGUENSE",
+            "NICARAGÜENSE"
+          ],
+          CRI: [
+            "CR",
+            "COSTA RICA",
+            "COSTA RICAN",
+            "COSTARRIQUENHO",
+            "COSTARRICENSE"
+          ],
+          DOM: [
+            "DO",
+            "DOMINICAN REPUBLIC",
+            "REPÚBLICA DOMINICANA",
+            "DOMINICAN",
+            "DOMINICANO"
+          ],
+          CUB: ["CU", "CUBA", "CUBAN", "CUBANO", "CUBANA"],
+          HTI: ["HT", "HAITI", "HAITIAN", "HAITIANO", "HAITIANA"],
+          PRT: [
+            "PT",
+            "PORTUGAL",
+            "PORTUGUESE",
+            "PORTUGUÊS",
+            "PORTUGUESA"
+          ]
         };
-        const aliases = codeMap[natNorm] ?? [];
-        const matches =
+
+        // Resolve um valor (já norm()-ed) para o ISO3 canônico, ou null.
+        const resolveCountry = (value: string): string | null => {
+          if (!value) return null;
+          // Match exato pelo código ISO3 (chave do mapa)
+          if (COUNTRY_TOKENS[value]) return value;
+          for (const [iso, tokens] of Object.entries(COUNTRY_TOKENS)) {
+            for (const tok of tokens) {
+              const tokN = norm(tok);
+              if (value === tokN) return iso;
+              // tolerância: token contido no value (ex: "BRAZILIAN" em
+              // "BRAZILIAN CITIZEN") ou vice-versa
+              if (
+                tokN.length >= 3 &&
+                (value.includes(tokN) || tokN.includes(value))
+              ) {
+                return iso;
+              }
+            }
+          }
+          return null;
+        };
+
+        const isoFromPassport = resolveCountry(natNorm);
+        const isoFromForm = resolveCountry(formNorm);
+
+        // Se ambos resolveram pro MESMO país → equivalente
+        const sameCountry =
+          isoFromPassport !== null &&
+          isoFromForm !== null &&
+          isoFromPassport === isoFromForm;
+
+        // Fallback: se um dos lados não resolveu, tenta substring match
+        const substringMatch =
           natNorm === formNorm ||
-          natNorm.includes(formNorm) ||
-          formNorm.includes(natNorm) ||
-          aliases.some((a) => formNorm.includes(a));
+          (natNorm.length >= 3 && formNorm.includes(natNorm)) ||
+          (formNorm.length >= 3 && natNorm.includes(formNorm));
+
+        const matches = sameCountry || substringMatch;
+
         if (!matches) {
           out.push({
             severity: "alta",
