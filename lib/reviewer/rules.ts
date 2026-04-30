@@ -361,19 +361,19 @@ function applyLevel1PerForm(
   }
 
   // Physical address
+  // Ajuste calibração rodada 3 (Flavia 30/04): quando há proof_of_address
+  // detectado e o titular bate com o principal, aceitar como OK_BY_PROOF
+  // sem exigir match exato do endereço normalizado (proof pode ter sido
+  // extraído com pequenas variações, ex: "Suite 200" vs "Ste 200A"). Ainda
+  // assim, manter um único finding informativo, deixando a Go Visa apenas
+  // confirmar que o comprovante anexo cobre o endereço usado.
   if ("physical_address" in f && f.physical_address !== undefined) {
     if (!sameAddress(f.physical_address)) {
-      // Ajuste 1.1 (Flavia): severidade depende de proof_of_address
       const proof = ctx.proofOfAddress;
-      const proofMatchesPrincipal =
-        !!proof &&
-        proof.found === true &&
-        proof.holder_match === "principal" &&
-        sameAddress(proof.address ?? undefined, GOVISA_ADDRESS) === false &&
-        // o proof aponta para o mesmo endereço do form
-        sameAddress(f.physical_address, (proof.address as any) ?? GOVISA_ADDRESS) === true;
+      const proofIsPrincipal =
+        !!proof && proof.found === true && proof.holder_match === "principal";
 
-      if (proofMatchesPrincipal) {
+      if (proofIsPrincipal) {
         out.push({
           severity: "baixa",
           tier: "tier1_filing",
@@ -384,9 +384,9 @@ function applyLevel1PerForm(
           found: addrToStr(f.physical_address),
           source: formName,
           explanation:
-            "Physical Address não é o da Go Visa, mas há comprovante de residência anexo confirmando esse endereço para o principal.",
+            "Physical Address não é o da Go Visa, mas há comprovante de residência anexo em nome do principal.",
           recommendation:
-            "OK: comprovante de residência valida endereço pessoal. Confirmar que o comprovante consta no protocolo.",
+            "OK: comprovante de residência valida o endereço pessoal. Confirmar que o comprovante anexo cobre o endereço usado neste formulário.",
           rule_id: RULE_IDS.T_FILING_PHYSICAL_ADDR_OK_BY_PROOF,
           subject_id: sid
         });
@@ -517,18 +517,26 @@ function applyLevel1PerForm(
         });
       }
     }
+    // Ajuste calibração rodada 3 (Flavia 30/04): SSN em branco na maioria
+    // dos casos novos (vítima de tráfico recém-chegada, sem histórico nos
+    // EUA) é o estado natural — não é erro. Só vale como observação quando
+    // o cliente tem A-number prévio ou histórico que faria esperar SSN.
+    // Pra evitar ruído, mantemos somente em forms onde USCIS explicitamente
+    // espera SSN preenchido (I-765 EAD), e só quando há sinal de histórico.
     if (
       FORMS_WITH_SSN_FIELD.has(f.form) &&
-      (p.ssn === null || p.ssn === undefined || p.ssn === "")
+      f.form === "I-765" &&
+      (p.ssn === null || p.ssn === undefined || p.ssn === "") &&
+      !!p.a_number
     ) {
       out.push({
         severity: "baixa",
-        tier: "tier1_filing",
+        tier: "tier3_estrategico",
         category: "campo_vazio",
         field: "SSN",
         form: formName,
         explanation:
-          "SSN em branco. Se o cliente não tem SSN, marcar explicitamente 'None' ao invés de deixar em branco.",
+          "SSN em branco no I-765, mas o cliente tem A-number prévio. Verificar se o cliente já teve SSN emitido.",
         rule_id: RULE_IDS.T_FILING_SSN_EMPTY,
         subject_id: sid
       });
@@ -1611,17 +1619,19 @@ function applyLevel4Global(args: {
       }
       if (!a.relationship_evidence_mentioned || a.relationship_evidence_mentioned.length === 0) {
         out.push({
-          // Ajuste (Flavia 29/04): a evidência (certidão de nascimento ou
-          // casamento) costuma estar na seção "Identification Documents" do
-          // processo, não vinculada explicitamente ao I-914A. Rebaixado para
-          // media e mensagem pede que o time confirme manualmente.
-          severity: "media",
-          tier: "tier1_filing",
-          category: "suporte_documental",
+          // Ajuste calibração rodada 3 (Flavia 30/04): a Go Visa anexa as
+          // certidões em "Identification Documents", não no I-914A em si.
+          // Como o sistema ainda não cruza esses documentos automaticamente,
+          // o finding fica como observação estratégica (baixa, tier3) ao
+          // invés de bloqueante. A próxima rodada de calibração liga o
+          // extractor de Identification Documents ao I-914A.
+          severity: "baixa",
+          tier: "tier3_estrategico",
+          category: "estrategia",
           field: "I-914A — Evidência da relação",
           form: "I-914A",
           explanation:
-            "Não foi possível identificar evidência do qualifying relationship vinculada a este I-914A. Confirmar se a certidão de nascimento ou casamento está em Identification Documents do processo.",
+            "O sistema não localizou explicitamente a evidência do relacionamento dentro do I-914A. Confirmar manualmente se a certidão de nascimento ou casamento está em Identification Documents do processo.",
           rule_id: RULE_IDS.T_DEP_I914A_NO_EVIDENCE,
           subject_id: sid
         });
@@ -2061,8 +2071,18 @@ function applyLevel4Global(args: {
       }
     }
 
-    // Quality issues reportados pelo extractor de visão
-    if (check.quality_issues && check.quality_issues.length > 0) {
+    // Quality issues reportados pelo extractor de visão.
+    // Ajuste calibração rodada 3 (Flavia 30/04): só emitir quando o sistema
+    // efetivamente identificou imagem de passaporte. Em casos onde o
+    // splitter classifica páginas como "Identification Documents" mas elas
+    // contêm só certidões/traduções (e não passaporte), as "quality_issues"
+    // viram falso positivo ("tem passaporte" segundo o time, mas o passport
+    // está em outro sub-PDF não detectado).
+    if (
+      check.has_passport_image &&
+      check.quality_issues &&
+      check.quality_issues.length > 0
+    ) {
       out.push({
         severity: "media",
         tier: "tier1_filing",
@@ -2596,7 +2616,43 @@ export function applyGovisaRules(args: RulesInput | RulesInputV2): Finding[] {
     })
   );
 
-  return out;
+  // Dedup de findings repetidos pelo mesmo subject (calibração rodada 3,
+  // Flavia 30/04). Se o mesmo subject_id recebe a MESMA rule_id em N forms
+  // (exemplo: T_FILING_PHYSICAL_ADDR_OK_BY_PROOF disparado em 5 forms do
+  // principal, ou T_FILING_PHYSICAL_ADDR_NEEDS_PROOF), agrupamos em um
+  // único finding informando os forms onde a regra disparou. Isso reduz o
+  // ruído visual sem perder a informação.
+  const DEDUP_RULES = new Set<string>([
+    RULE_IDS.T_FILING_PHYSICAL_ADDR_OK_BY_PROOF,
+    RULE_IDS.T_FILING_PHYSICAL_ADDR_NEEDS_PROOF,
+    RULE_IDS.T_FILING_PHYSICAL_ADDR_NOT_GOVISA,
+    RULE_IDS.T_FILING_SAFE_MAILING_NOT_GOVISA,
+    RULE_IDS.T_FILING_IN_CARE_OF_MISSING,
+    RULE_IDS.T_FILING_MAILING_NOT_GOVISA
+  ]);
+  const seen = new Map<string, Finding>();
+  const deduped: Finding[] = [];
+  for (const f of out) {
+    if (!f.rule_id || !DEDUP_RULES.has(f.rule_id) || !f.subject_id) {
+      deduped.push(f);
+      continue;
+    }
+    const key = `${f.rule_id}::${f.subject_id}`;
+    const prev = seen.get(key);
+    if (!prev) {
+      seen.set(key, f);
+      deduped.push(f);
+    } else {
+      const prevForm = prev.form ?? "";
+      const newForm = f.form ?? "";
+      if (newForm && !prevForm.includes(newForm)) {
+        prev.form = prevForm
+          ? Array.from(new Set([...prevForm.split(", ").filter(Boolean), newForm])).join(", ")
+          : newForm;
+      }
+    }
+  }
+  return deduped;
 }
 
 // ---------------------------------------------------------------------------
