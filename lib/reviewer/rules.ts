@@ -2618,17 +2618,24 @@ export function applyGovisaRules(args: RulesInput | RulesInputV2): Finding[] {
 
   // Dedup de findings repetidos pelo mesmo subject (calibração rodada 3,
   // Flavia 30/04). Se o mesmo subject_id recebe a MESMA rule_id em N forms
-  // (exemplo: T_FILING_PHYSICAL_ADDR_OK_BY_PROOF disparado em 5 forms do
-  // principal, ou T_FILING_PHYSICAL_ADDR_NEEDS_PROOF), agrupamos em um
-  // único finding informando os forms onde a regra disparou. Isso reduz o
-  // ruído visual sem perder a informação.
+  // (ex: PHYSICAL_ADDR disparado em 5 forms do principal), agrupamos em um
+  // único finding informando os forms onde a regra disparou. Reduz ruído
+  // visual sem perder a informação.
   const DEDUP_RULES = new Set<string>([
     RULE_IDS.T_FILING_PHYSICAL_ADDR_OK_BY_PROOF,
     RULE_IDS.T_FILING_PHYSICAL_ADDR_NEEDS_PROOF,
     RULE_IDS.T_FILING_PHYSICAL_ADDR_NOT_GOVISA,
     RULE_IDS.T_FILING_SAFE_MAILING_NOT_GOVISA,
     RULE_IDS.T_FILING_IN_CARE_OF_MISSING,
-    RULE_IDS.T_FILING_MAILING_NOT_GOVISA
+    RULE_IDS.T_FILING_MAILING_NOT_GOVISA,
+    RULE_IDS.T_FILING_INTERPRETER_SIG_MISSING,
+    RULE_IDS.T_FILING_PREPARER_SIG_MISSING,
+    RULE_IDS.T_FILING_PERSON_FAMILY_NAME_EMPTY,
+    RULE_IDS.T_FILING_PERSON_GIVEN_NAME_EMPTY,
+    RULE_IDS.T_FILING_PERSON_DOB_EMPTY,
+    RULE_IDS.T_FILING_PERSON_BIRTH_COUNTRY_EMPTY,
+    RULE_IDS.T_FILING_PERSON_PASSPORT_EMPTY,
+    RULE_IDS.T_FILING_SSN_EMPTY
   ]);
   const seen = new Map<string, Finding>();
   const deduped: Finding[] = [];
