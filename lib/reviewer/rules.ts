@@ -44,7 +44,9 @@ export const CURRENT_USCIS_EDITIONS: Record<string, string[]> = {
   "I-918B": ["01/20/25", "12/16/24", "06/12/24"],
   "I-192":  ["01/20/25", "10/15/24"],
   "I-765":  ["08/21/25", "04/01/24", "01/19/24"],
-  "G-28":   ["01/19/24", "05/05/22"],
+  // Calibração Flavia 04/05: 09/17/18 ainda é aceita pela USCIS, foi marcada
+  // como falso positivo em 11 ocorrências em 4 reviews diferentes.
+  "G-28":   ["01/19/24", "05/05/22", "09/17/18"],
   "I-360":  ["01/20/25", "07/24/24", "01/19/24"]
 };
 
@@ -155,6 +157,36 @@ function sameAddress(a: Address | undefined | null, ref = GOVISA_ADDRESS): boole
     norm(a.state) === norm(ref.state) &&
     norm(a.zip) === norm(ref.zip)
   );
+}
+
+/**
+ * Compara dois endereços tolerante a variações comuns:
+ * - sufixos de unidade (Ste/Suite/Apt/Apartment/#) ignorados
+ * - zip+4 vs zip5: compara só os 5 primeiros dígitos
+ * - city/state/street tokenizados (ordem/abreviação tolerada)
+ *
+ * Usado pra cruzar Physical Address de form com endereço de comprovante de
+ * residência, que costumam ter pequenas variações textuais ("Ste 200" vs
+ * "Suite 200A", "32810" vs "32810-1234").
+ */
+function addressLooselyEqual(
+  a: Address | undefined | null,
+  b: Address | undefined | null
+): boolean {
+  if (!a || !b) return false;
+  const stripUnit = (s?: string | null) =>
+    norm(s)
+      .replace(/\b(STE|SUITE|APT|APARTMENT|UNIT|#)\b\.?/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  const zip5 = (s?: string | null) => norm(s).replace(/\D/g, "").slice(0, 5);
+  if (stripUnit(a.street) !== stripUnit(b.street)) return false;
+  if (norm(a.city) !== norm(b.city)) return false;
+  if (norm(a.state) !== norm(b.state)) return false;
+  const za = zip5(a.zip);
+  const zb = zip5(b.zip);
+  if (za && zb && za !== zb) return false;
+  return true;
 }
 
 function addrToStr(a?: Address | null | typeof GOVISA_ADDRESS): string {
@@ -346,67 +378,67 @@ function applyLevel1PerForm(
       // Ajuste (Flavia 29/04): rebaixado de alta para media. Casos reais
       // mostraram extração da edition_date com ruído ou edições antigas
       // ainda aceitas pela USCIS. Time confere antes de tratar como bloqueante.
-      severity: "media",
+      severity: "baixa",
       tier: "tier1_filing",
       category: "regra_govisa",
       field: `${formName} — Edition Date`,
       form: formName,
-      expected: `Edição vigente USCIS (${accepted.join(" ou ")})`,
+      expected: `Edição USCIS conhecida (${accepted.join(" ou ")})`,
       found: editionDate ?? "(vazio)",
-      explanation: `Edição do ${formName} (${editionDate}) é anterior a 2024 — verificar se ainda é aceita pela USCIS.`,
-      recommendation: `Conferir em uscis.gov/${formName.toLowerCase()} se a edição (${editionDate}) ainda é aceita; se não, substituir pela vigente.`,
+      explanation: `Edição do ${formName} (${editionDate}) não está na lista de edições conhecidas — verificar se ainda é aceita pela USCIS antes de substituir.`,
+      recommendation: `Apenas conferir em uscis.gov/${formName.toLowerCase()} se a edição (${editionDate}) ainda é aceita. Edições anteriores costumam continuar válidas por meses.`,
       rule_id: RULE_IDS.DOC_EDITION_OUTDATED,
       subject_id: sid
     });
   }
 
   // Physical address
-  // Ajuste calibração rodada 3 (Flavia 30/04): quando há proof_of_address
-  // detectado e o titular bate com o principal, aceitar como OK_BY_PROOF
-  // sem exigir match exato do endereço normalizado (proof pode ter sido
-  // extraído com pequenas variações, ex: "Suite 200" vs "Ste 200A"). Ainda
-  // assim, manter um único finding informativo, deixando a Go Visa apenas
-  // confirmar que o comprovante anexo cobre o endereço usado.
+  // Calibração rodada 4 (Flavia 04/05): a premissa correta da Go Visa é que
+  // Physical Address é o endereço PESSOAL do cliente (não o da firma). Pode
+  // vir em branco em casos onde o cliente prefere não expor o próprio
+  // endereço — usa-se o da Go Visa apenas como exceção.
+  //
+  // Lógica:
+  // - vazio → silêncio (caso normal)
+  // - bate com Go Visa → silêncio (exceção legítima)
+  // - endereço pessoal + comprovante bate (loose match) → silêncio
+  // - endereço pessoal + comprovante diverge → MISMATCH (alta)
+  // - endereço pessoal + sem comprovante detectado → PROOF_MISSING (informativa)
   if ("physical_address" in f && f.physical_address !== undefined) {
-    if (!sameAddress(f.physical_address)) {
-      const proof = ctx.proofOfAddress;
-      const proofIsPrincipal =
-        !!proof && proof.found === true && proof.holder_match === "principal";
+    const addr = f.physical_address;
+    const isEmpty =
+      !addr || (!addr.street && !addr.city && !addr.state && !addr.zip);
 
-      if (proofIsPrincipal) {
-        out.push({
-          severity: "baixa",
-          tier: "tier1_filing",
-          category: "regra_govisa",
-          field: "Physical Address",
-          form: formName,
-          expected: addrToStr(GOVISA_ADDRESS),
-          found: addrToStr(f.physical_address),
-          source: formName,
-          explanation:
-            "Physical Address não é o da Go Visa, mas há comprovante de residência anexo em nome do principal.",
-          recommendation:
-            "OK: comprovante de residência valida o endereço pessoal. Confirmar que o comprovante anexo cobre o endereço usado neste formulário.",
-          rule_id: RULE_IDS.T_FILING_PHYSICAL_ADDR_OK_BY_PROOF,
-          subject_id: sid
-        });
-      } else if (proof && proof.found && proof.holder_match !== "principal") {
-        out.push({
-          severity: "baixa",
-          tier: "tier1_filing",
-          category: "regra_govisa",
-          field: "Physical Address",
-          form: formName,
-          expected: addrToStr(GOVISA_ADDRESS),
-          found: addrToStr(f.physical_address),
-          source: formName,
-          explanation:
-            "Physical Address não é da Go Visa e o comprovante de residência detectado não está em nome do principal.",
-          recommendation:
-            "Anexar comprovante de residência em nome do principal OU atualizar Physical Address para Go Visa.",
-          rule_id: RULE_IDS.T_FILING_PHYSICAL_ADDR_NEEDS_PROOF,
-          subject_id: sid
-        });
+    if (!isEmpty && !sameAddress(addr)) {
+      const proof = ctx.proofOfAddress;
+      const proofForSubject =
+        !!proof &&
+        proof.found === true &&
+        (proof.matched_subject_id === sid ||
+          (sid === "principal" && proof.holder_match === "principal"));
+
+      if (proofForSubject) {
+        const proofAddr = (proof as any).address as Address | undefined;
+        if (proofAddr && addressLooselyEqual(addr, proofAddr)) {
+          // OK silencioso: endereço pessoal validado pelo comprovante.
+        } else {
+          out.push({
+            severity: "alta",
+            tier: "tier1_filing",
+            category: "regra_govisa",
+            field: "Physical Address",
+            form: formName,
+            expected: addrToStr(proofAddr ?? null),
+            found: addrToStr(addr),
+            source: formName,
+            explanation:
+              "Physical Address informado no formulário não bate com o endereço do comprovante de residência anexo.",
+            recommendation:
+              "Conferir o comprovante de residência: ajustar o Physical Address pra refletir o endereço do comprovante OU substituir o comprovante por um que valide o endereço informado.",
+            rule_id: RULE_IDS.T_FILING_PHYSICAL_ADDR_MISMATCH_PROOF,
+            subject_id: sid
+          });
+        }
       } else {
         out.push({
           severity: "baixa",
@@ -414,14 +446,14 @@ function applyLevel1PerForm(
           category: "regra_govisa",
           field: "Physical Address",
           form: formName,
-          expected: addrToStr(GOVISA_ADDRESS),
-          found: addrToStr(f.physical_address),
+          expected: "—",
+          found: addrToStr(addr),
           source: formName,
           explanation:
-            "Physical Address não é o da Go Visa e não há comprovante de residência anexo confirmando o endereço pessoal.",
+            "Physical Address pessoal informado, mas o sistema não localizou comprovante de residência anexo confirmando este endereço.",
           recommendation:
-            "Anexar comprovante de residência (utility bill, contrato de aluguel, bank statement) em nome do principal.",
-          rule_id: RULE_IDS.T_FILING_PHYSICAL_ADDR_NEEDS_PROOF,
+            "Apenas verificar se há comprovante de residência (utility bill, contrato de aluguel, bank statement, IRS letter) anexo ao processo. Se houver e o sistema não detectou, reportar pra calibração; se não houver, anexar.",
+          rule_id: RULE_IDS.T_FILING_PHYSICAL_ADDR_PROOF_MISSING,
           subject_id: sid
         });
       }
@@ -431,8 +463,17 @@ function applyLevel1PerForm(
   // Safe Mailing Address
   if ("safe_mailing_address" in f && f.safe_mailing_address !== undefined) {
     const sma = f.safe_mailing_address;
+    // Calibração rodada 4 (Flavia 04/05): aceitar match tolerante (Ste/Suite,
+    // zip+4) — extractor frequentemente perde apt_number. Também: se o
+    // physical_address parece ser Go Visa e o safe_mailing parece pessoal,
+    // suspeitar de swap do extractor — não cobrar como erro.
+    const physicalAddr = (f as any).physical_address as Address | undefined;
+    const physicalIsGoVisa =
+      physicalAddr &&
+      (sameAddress(physicalAddr) || addressLooselyEqual(physicalAddr, GOVISA_ADDRESS));
+    const smaIsGoVisa = sameAddress(sma) || addressLooselyEqual(sma, GOVISA_ADDRESS);
     pushIf(
-      !sameAddress(sma),
+      !smaIsGoVisa && !physicalIsGoVisa,
       {
         severity: "critica",
         tier: "tier1_filing",
@@ -449,7 +490,11 @@ function applyLevel1PerForm(
       },
       out
     );
-    if (sma && norm(sma.in_care_of) !== norm(GOVISA_ADDRESS.in_care_of)) {
+    if (
+      sma &&
+      norm(sma.in_care_of) !== norm(GOVISA_ADDRESS.in_care_of) &&
+      !physicalIsGoVisa
+    ) {
       out.push({
         severity: "alta",
         tier: "tier1_filing",
@@ -467,9 +512,12 @@ function applyLevel1PerForm(
   }
 
   // Mailing address
+  // Calibração rodada 4 (Flavia 04/05): aceitar match tolerante (Suite/Ste, zip+4).
   if ("mailing_address" in f && f.mailing_address !== undefined && f.mailing_address) {
+    const ma = f.mailing_address;
+    const maIsGoVisa = sameAddress(ma) || addressLooselyEqual(ma, GOVISA_ADDRESS);
     pushIf(
-      !sameAddress(f.mailing_address),
+      !maIsGoVisa,
       {
         severity: "alta",
         tier: "tier1_filing",
@@ -477,7 +525,7 @@ function applyLevel1PerForm(
         field: "Mailing Address",
         form: formName,
         expected: addrToStr(GOVISA_ADDRESS),
-        found: addrToStr(f.mailing_address),
+        found: addrToStr(ma),
         source: formName,
         explanation: "Mailing Address deve apontar para a Go Visa.",
         rule_id: RULE_IDS.T_FILING_MAILING_NOT_GOVISA,
@@ -490,7 +538,10 @@ function applyLevel1PerForm(
   // Person — campos vazios
   // Ajuste (Flavia 29/04): nem todo form tem campo de Passport ou SSN.
   // Só rodamos esses checks nos forms que de fato exibem o campo no PDF do USCIS.
-  const FORMS_WITH_PASSPORT_FIELD = new Set(["I-914", "I-914A", "I-192", "I-918", "I-918A", "I-360"]);
+  // Calibração rodada 4 (Flavia 04/05): I-192 tem campo de passaporte mas é
+  // opcional pela USCIS — Go Visa não preenche por padrão e cobrar gera
+  // falso positivo recorrente. Removido.
+  const FORMS_WITH_PASSPORT_FIELD = new Set(["I-914", "I-914A", "I-918", "I-918A", "I-360"]);
   const FORMS_WITH_SSN_FIELD = new Set(["I-914", "I-914A", "I-765", "I-918", "I-918A", "I-360"]);
   if ("person" in f && f.person) {
     const p = f.person;
@@ -517,15 +568,16 @@ function applyLevel1PerForm(
         });
       }
     }
-    // Ajuste calibração rodada 3 (Flavia 30/04): SSN em branco na maioria
-    // dos casos novos (vítima de tráfico recém-chegada, sem histórico nos
-    // EUA) é o estado natural — não é erro. Só vale como observação quando
-    // o cliente tem A-number prévio ou histórico que faria esperar SSN.
-    // Pra evitar ruído, mantemos somente em forms onde USCIS explicitamente
-    // espera SSN preenchido (I-765 EAD), e só quando há sinal de histórico.
+    // Calibração rodada 4 (Flavia 04/05): SSN em branco é o estado natural
+    // pra vítima de tráfico/abuso recém-chegada. Mesmo com A-number, dependentes
+    // tipicamente vieram com o principal e não tiveram emprego legal anterior.
+    // Suprimir o finding em dependentes; manter informativo no principal apenas
+    // quando há A-number (sinal de histórico imigratório prévio).
+    const isPrincipalSubject = subject?.role === "principal";
     if (
       FORMS_WITH_SSN_FIELD.has(f.form) &&
       f.form === "I-765" &&
+      isPrincipalSubject &&
       (p.ssn === null || p.ssn === undefined || p.ssn === "") &&
       !!p.a_number
     ) {
@@ -536,7 +588,7 @@ function applyLevel1PerForm(
         field: "SSN",
         form: formName,
         explanation:
-          "SSN em branco no I-765, mas o cliente tem A-number prévio. Verificar se o cliente já teve SSN emitido.",
+          "SSN em branco no I-765 do principal, com A-number prévio. Apenas verificar se o cliente já teve SSN emitido.",
         rule_id: RULE_IDS.T_FILING_SSN_EMPTY,
         subject_id: sid
       });
@@ -644,8 +696,35 @@ function applyLevel2IntraCluster(
         ? namesPlausiblyEqual(a, b)
         : norm(a) === norm(b);
       if (!equivalent) {
+        // Calibração rodada 4 (Flavia 04/05): pra A-Number especificamente,
+        // a Flavia confirmou que no PDF físico os números estão corretos —
+        // a divergência é falha do extractor (geralmente swap A-number/SSN).
+        // Quando detectamos o swap, emitir um rule_id distinto e mais brando
+        // ao invés de cobrar como erro do filing.
+        let severity: "critica" | "alta" = "critica";
+        let useRuleId = rid;
+        let explanation = `${label} divergente entre formulários do mesmo sujeito. USCIS cruza dados e isso dá RFE.`;
+        let recommendation =
+          "Padronizar o valor usando documento oficial (passaporte/certidão) como fonte da verdade.";
+        if (label === "A-Number") {
+          const refSsn = norm(reference.ssn ?? "");
+          const fSsn = norm(p.ssn ?? "");
+          const swapDetected =
+            (refSsn && norm(b ?? "") === refSsn) ||
+            (fSsn && norm(a ?? "") === fSsn);
+          if (swapDetected) {
+            severity = "alta";
+            useRuleId = RULE_IDS.T_CONS_ANUMBER_SSN_EXTRACTOR_SWAP;
+            explanation =
+              "A-Number e SSN aparecem trocados entre formulários do mesmo sujeito — provável falha do extrator de dados, não do filing. Conferir nos PDFs originais.";
+            recommendation =
+              "Verificar diretamente nos PDFs se A-Number e SSN estão na ordem correta. Se OK no impresso, ignorar — é falha do extractor.";
+          } else {
+            severity = "alta";
+          }
+        }
         out.push({
-          severity: "critica",
+          severity,
           tier: "tier1_filing",
           category: "divergencia",
           field: label,
@@ -653,10 +732,9 @@ function applyLevel2IntraCluster(
           expected: `${a} (em ${personForms[0].form})`,
           found: `${b} (em ${f.form})`,
           source: `${personForms[0].form} vs ${f.form} (sujeito ${subject.display_name})`,
-          explanation: `${label} divergente entre formulários do mesmo sujeito. USCIS cruza dados e isso dá RFE.`,
-          recommendation:
-            "Padronizar o valor usando documento oficial (passaporte/certidão) como fonte da verdade.",
-          rule_id: rid,
+          explanation,
+          recommendation,
+          rule_id: useRuleId,
           subject_id: subject.id
         });
       }
@@ -1144,9 +1222,24 @@ function applyLevel4Global(args: {
 
     if (i914?.entry?.last_entry_date && story.year_entered_us) {
       const formYear = (i914.entry.last_entry_date.match(/\d{4}/) ?? [""])[0];
-      if (formYear && formYear !== story.year_entered_us) {
+      // Calibração rodada 4 (Flavia 04/05): "ano da história" frequentemente
+      // refere à PRIMEIRA entrada, mas last_entry_date é a ÚLTIMA. Quando o
+      // form é mais recente que a história, é provável múltipla entrada e
+      // não acusamos divergência. Quando só temos year, a comparação é
+      // pobre demais — rebaixar pra baixa e contextualizar.
+      const travelHistory = ((i914.entry as any)?.travel_history ?? []) as any[];
+      const hasMultipleEntries = Array.isArray(travelHistory) && travelHistory.length > 0;
+      const formYearN = parseInt(formYear || "0", 10);
+      const storyYearN = parseInt(story.year_entered_us, 10);
+      const formIsLater = formYearN > storyYearN;
+      if (
+        formYear &&
+        formYear !== story.year_entered_us &&
+        !hasMultipleEntries &&
+        !formIsLater
+      ) {
         out.push({
-          severity: "alta",
+          severity: "baixa",
           tier: "tier2_substantivo",
           category: "credibilidade",
           field: "Last Entry Date",
@@ -1154,7 +1247,7 @@ function applyLevel4Global(args: {
           expected: `${story.year_entered_us} (história)`,
           found: `${i914.entry.last_entry_date} (I-914)`,
           source: "história vs I-914",
-          explanation: "Ano de entrada nos EUA na história não bate com o formulário.",
+          explanation: "Ano de entrada na história anterior ao last_entry_date do I-914 — confirmar se cliente teve múltiplas entradas (caso comum, history descreve a primeira e o form pede a última).",
           rule_id: RULE_IDS.T_CONS_ENTRY_YEAR_DIVERGE,
           subject_id: principalSubject?.id ?? null
         });
@@ -1179,13 +1272,17 @@ function applyLevel4Global(args: {
       }
     }
 
-    // Ajuste (Flavia 29/04): só dispara quando a história afirma cônjuge mas o
-    // formulário diz solteiro. O caso oposto (form casado, história sem citar
-    // esposo) NÃO é divergência: a história não precisa nomear o cônjuge.
+    // Ajuste rodada 4 (Flavia 04/05): só dispara quando a história afirma cônjuge
+    // E o formulário marca EXPLICITAMENTE solteiro/divorciado. Quando o
+    // marital_status do form vem null (extractor não conseguiu ler) NÃO acusar —
+    // os 3 reviews onde isso disparou tinham form.marital_status=null mas a
+    // Flavia confirmou no PDF físico que estava marcado "Married".
     const storyHasSpouse =
       !!story.spouse_name || normalizeMarital(story.marital_status) === "casado";
-    const formHasSpouse = normalizeMarital(reference.marital_status) === "casado";
-    if (storyHasSpouse && !formHasSpouse) {
+    const formMarital = normalizeMarital(reference.marital_status);
+    const formExplicitlyNotMarried =
+      !!formMarital && formMarital !== "casado" && formMarital !== "uniao_estavel";
+    if (storyHasSpouse && formExplicitlyNotMarried) {
       out.push({
         severity: "critica",
         tier: "tier2_substantivo",
@@ -1618,23 +1715,42 @@ function applyLevel4Global(args: {
         }
       }
       if (!a.relationship_evidence_mentioned || a.relationship_evidence_mentioned.length === 0) {
-        out.push({
-          // Ajuste calibração rodada 3 (Flavia 30/04): a Go Visa anexa as
-          // certidões em "Identification Documents", não no I-914A em si.
-          // Como o sistema ainda não cruza esses documentos automaticamente,
-          // o finding fica como observação estratégica (baixa, tier3) ao
-          // invés de bloqueante. A próxima rodada de calibração liga o
-          // extractor de Identification Documents ao I-914A.
-          severity: "baixa",
-          tier: "tier3_estrategico",
-          category: "estrategia",
-          field: "I-914A — Evidência da relação",
-          form: "I-914A",
-          explanation:
-            "O sistema não localizou explicitamente a evidência do relacionamento dentro do I-914A. Confirmar manualmente se a certidão de nascimento ou casamento está em Identification Documents do processo.",
-          rule_id: RULE_IDS.T_DEP_I914A_NO_EVIDENCE,
-          subject_id: sid
-        });
+        // Calibração rodada 4 (Flavia 04/05):
+        // - Aceitar passaporte do dependente como evidência da relação (Flavia: "tem passaporte").
+        // - Aceitar certidão de casamento do principal como evidência quando o dep é cônjuge.
+        // - Aceitar passport_check do dependente (passaporte detectado na imagem).
+        // - Aceitar a_number ou ssn no family_member como sinal de que houve documentação USCIS prévia.
+        const depHasPassportNumber = !!a.family_member?.passport_number;
+        const depHasPassportImage = passportChecks.some(
+          (pc) => pc.subject_id === sid && pc.check?.has_passport_image === true
+        );
+        const depHasUscisIds = !!a.family_member?.a_number || !!a.family_member?.ssn;
+        const rel = (a.relationship_to_principal ?? "").toLowerCase();
+        const isSpouse = /spouse|cônjuge|conjuge|wife|husband|esposa|esposo|marido/.test(rel);
+        const principalMaritalSays = /married|casado|casada|spouse/.test(
+          norm(i914?.person?.marital_status ?? "").toLowerCase()
+        );
+        const marriageIsImplicit = isSpouse && principalMaritalSays;
+
+        const hasAnyEvidence =
+          depHasPassportNumber ||
+          depHasPassportImage ||
+          depHasUscisIds ||
+          marriageIsImplicit;
+
+        if (!hasAnyEvidence) {
+          out.push({
+            severity: "baixa",
+            tier: "tier3_estrategico",
+            category: "estrategia",
+            field: "I-914A — Evidência da relação",
+            form: "I-914A",
+            explanation:
+              "O sistema não localizou evidência do relacionamento (sem passaporte, sem A-number/SSN do dependente, sem indicação de cônjuge no marital status do principal). Apenas confirmar se há certidão de nascimento/casamento em Identification Documents.",
+            rule_id: RULE_IDS.T_DEP_I914A_NO_EVIDENCE,
+            subject_id: sid
+          });
+        }
       }
       if (a.location === "abroad") {
         out.push({
@@ -1653,9 +1769,21 @@ function applyLevel4Global(args: {
   }
 
   // ---- Passport checks (loop) — Ajuste 23.1: critica em qualquer modo ----
+  // Calibração rodada 4 (Flavia 04/05): se subject_id vier null, NÃO assumir
+  // principal — tentar inferir pelo holder_name cruzando com sujeitos. Se nem
+  // assim resolver, deixar sid=null e NÃO emitir findings VS_FORM (evita o
+  // bug onde passaporte da esposa virava finding contra o I-914 do principal).
   for (const pc of passportChecks) {
     const check = pc.check;
-    const sid = pc.subject_id ?? principalSubject?.id ?? null;
+    let sid = pc.subject_id ?? null;
+    if (!sid && (pc as any).holder_name) {
+      const holderName = (pc as any).holder_name as string;
+      const matchedSubject = subjects.find((s) => {
+        const subjFull = `${s.given_name ?? ""} ${s.family_name ?? ""}`.trim();
+        return subjFull && namesPlausiblyEqual(holderName, subjFull);
+      });
+      if (matchedSubject) sid = matchedSubject.id;
+    }
     if (check.has_passport_image && check.signed === false) {
       out.push({
         severity: "critica",
@@ -1694,13 +1822,16 @@ function applyLevel4Global(args: {
       ) as any;
       personOfSubject = depForm?.family_member ?? null;
       personFormName = depForm?.form ?? "I-914A";
-    } else if (reference) {
+    } else if (sid === "principal" && reference) {
       personOfSubject = reference;
       const principalForm = forms.find(
         (f) => f.form === "I-914" || (f as any).form === "I-918"
       ) as any;
       personFormName = principalForm?.form ?? "I-914";
     }
+    // sid=null: passaporte solto, dono não identificado. Não cruza com forms
+    // pra evitar falsos positivos (passaporte da esposa virando finding do
+    // principal). O DOC_PASSPORT_SIG_MISSING acima já cobriu o necessário.
 
     // Helpers de comparação tolerante
     const fieldDiverges = (
@@ -1770,24 +1901,51 @@ function applyLevel4Global(args: {
         true
       );
       // Country of birth — passaporte traz "Place of Birth" que pode incluir cidade,
-      // estado e país numa string só. O formulário separa em campos distintos
-      // (cidade, estado, país). Ajuste (Flavia 29/04): comparamos por overlap
-      // de tokens, considerando coerente quando QUALQUER token relevante
-      // (>= 3 letras) do form aparece no place_of_birth do passaporte (ou vice-versa).
+      // estado e país numa string só (em PT-BR ou EN). O formulário separa em
+      // campos distintos. Calibração rodada 4 (Flavia 04/05): "BRASIL" vs "BRAZIL"
+      // estavam disparando como divergência. Solução: tokenizar com nomes
+      // canônicos por país (BRASIL ≡ BRAZIL ≡ BRAZILIAN ≡ BR) antes de comparar.
       if (check.place_of_birth_seen && personOfSubject.country_of_birth) {
         const placeNorm = norm(check.place_of_birth_seen);
         const countryNorm = norm(personOfSubject.country_of_birth);
+        const COUNTRY_ALIASES: Record<string, string[]> = {
+          BRASIL: ["BRAZIL", "BRA", "BR", "BRAZILIAN", "BRASILEIRO", "BRASILEIRA"],
+          BRAZIL: ["BRASIL", "BRA", "BR", "BRAZILIAN", "BRASILEIRO", "BRASILEIRA"]
+        };
+        const BRAZILIAN_STATES = new Set([
+          "AC","AL","AP","AM","BA","CE","DF","ES","GO","MA","MT","MS","MG",
+          "PA","PB","PR","PE","PI","RJ","RN","RS","RO","RR","SC","SP","SE","TO"
+        ]);
         const tokenize = (s: string) =>
           s
             .split(/[\s,;./-]+/)
             .map((t) => t.trim())
-            .filter((t) => t.length >= 3);
+            .filter((t) => t.length >= 2);
         const placeTokens = new Set(tokenize(placeNorm));
         const formTokens = tokenize(countryNorm);
+        // Expande tokens com aliases conhecidos
+        const placeExpanded = new Set<string>(placeTokens);
+        for (const t of placeTokens) {
+          for (const alias of COUNTRY_ALIASES[t] ?? []) placeExpanded.add(alias);
+        }
+        const formExpanded = new Set<string>(formTokens);
+        for (const t of formTokens) {
+          for (const alias of COUNTRY_ALIASES[t] ?? []) formExpanded.add(alias);
+        }
+        // Calibração rodada 4 (Flavia 04/05): passaporte brasileiro frequentemente
+        // só traz cidade/UF (ex: "VEREDA/BA", "ITAMBACURI/MG") sem repetir "Brasil".
+        // Quando o form diz "Brazil/Brasil" e o passaporte tem alguma UF brasileira,
+        // tratar como coerente.
+        const formIsBrazil = formTokens.some(
+          (t) => t === "BRAZIL" || t === "BRASIL" || t === "BR" || t === "BRA"
+        );
+        const placeHasBrazilianState = [...placeTokens].some((t) => BRAZILIAN_STATES.has(t));
         const overlap =
           placeNorm.includes(countryNorm) ||
           countryNorm.includes(placeNorm) ||
-          formTokens.some((t) => placeTokens.has(t));
+          formTokens.some((t) => placeExpanded.has(t)) ||
+          [...placeTokens].some((t) => formExpanded.has(t)) ||
+          (formIsBrazil && placeHasBrazilianState);
         if (!overlap) {
           out.push({
             severity: "media",
@@ -2624,6 +2782,8 @@ export function applyGovisaRules(args: RulesInput | RulesInputV2): Finding[] {
   const DEDUP_RULES = new Set<string>([
     RULE_IDS.T_FILING_PHYSICAL_ADDR_OK_BY_PROOF,
     RULE_IDS.T_FILING_PHYSICAL_ADDR_NEEDS_PROOF,
+    RULE_IDS.T_FILING_PHYSICAL_ADDR_MISMATCH_PROOF,
+    RULE_IDS.T_FILING_PHYSICAL_ADDR_PROOF_MISSING,
     RULE_IDS.T_FILING_PHYSICAL_ADDR_NOT_GOVISA,
     RULE_IDS.T_FILING_SAFE_MAILING_NOT_GOVISA,
     RULE_IDS.T_FILING_IN_CARE_OF_MISSING,

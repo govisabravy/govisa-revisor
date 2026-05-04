@@ -786,7 +786,17 @@ Comuns:
 - country_conditions: material sobre condições do país de origem (pode não existir em VAWA/U)
 - witness_statements: declarações de testemunhas
 - medical_records: registros médicos e psicológicos
-- proof_of_address: comprovantes de residência (utility bill, lease agreement, bank statement, government correspondence, IRS letter, etc.)
+- proof_of_address: comprovantes de RESIDÊNCIA (endereço onde a pessoa mora). Exemplos:
+  * utility bill / fatura de serviço público (luz, água, gás, internet, telefone fixo)
+  * lease agreement / contrato de aluguel ou rental agreement
+  * bank statement (extrato bancário com endereço)
+  * IRS letter / 1040 / W-2 / 1099 (com endereço residencial)
+  * voter registration card / cartão de eleitor
+  * vehicle registration / DMV correspondence
+  * paystub / holerite com endereço
+  * school records / matrícula escolar com endereço
+  * government correspondence (Social Security letter, USPS COA, etc.)
+  IMPORTANTE: comprovante de residência NÃO é documento de identidade. Não confunda com identification.
 - story: Declaration of <nome> / Personal Statement (narrativa em primeira pessoa)
 - final: final considerations
 - other: não se encaixa
@@ -808,6 +818,8 @@ REGRAS PARA AGRUPAMENTO POR SUJEITO (subject_id):
 - Se for impossível inferir (nome ilegível ou form genérico), deixar subject_id = null.
 - Para identification (passaportes): o subdoc pode conter MÚLTIPLOS passaportes. Liste CADA UM como entrada separada com subject_id apropriado e seu range de páginas próprio. Se houver 3 passaportes (principal + 2 deps), gere 3 entradas com kind="identification".
 - Para proof_of_address: holder_name = pessoa identificada → mapear pra subject_id correspondente.
+- DECOMPOSIÇÃO DE SEÇÕES MISTAS: seções rotuladas como "Additional ID Documents", "Supporting Documents", "Identification", "Anexos" frequentemente CONTÊM comprovantes de residência grudados com docs de identidade. Quando isso acontecer, gere ENTRADAS SEPARADAS por kind. Exemplo: páginas 169-181 com Birth Certificate (pgs 169-171), Marriage Certificate (172-174) e Utility Bill (175-181) → 2 entradas kind="identification" + 1 entrada kind="proof_of_address".
+- Não rotule um subdoc inteiro como "identification" só porque o título genérico sugere isso — olhe o conteúdo página a página e divida pelo tipo real.
 
 Use a tool map_document_structure para reportar o resultado.`;
 

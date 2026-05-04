@@ -800,6 +800,32 @@ export async function reviewProcess(input: ReviewInput): Promise<ReviewOutput> {
     });
     seniorFindings = [];
   }
+
+  // Calibração rodada 4 (Flavia 04/05): o LLM senior tem usado SENIOR_COVER_LETTER_OUTDATED
+  // pra findings que nada têm a ver com cover letter (inversão A-Number/SSN, family_name
+  // incompleto, edition_date G-28, fragmentação de address etc). Reclassificar pós-LLM
+  // pra rule_ids mais coerentes com o conteúdo do field/explanation, evitando que a
+  // Flavia veja o rótulo "COVER_LETTER_OUTDATED" em achados sobre passaporte.
+  for (const f of seniorFindings) {
+    if (f.rule_id !== "SENIOR_COVER_LETTER_OUTDATED") continue;
+    const haystack = `${f.field ?? ""} ${f.explanation ?? ""}`.toLowerCase();
+    const looksLikeCover = /cover[\s_-]?letter|carta\s+do\s+advogado|opening\s+letter/.test(haystack);
+    if (looksLikeCover) continue;
+    if (/a-?number|a_number|anumber|ssn/.test(haystack)) {
+      f.rule_id = "SENIOR_ANUMBER_SSN_INCONSISTENCY";
+    } else if (/passport/.test(haystack)) {
+      f.rule_id = "SENIOR_PASSPORT_INCONSISTENCY";
+    } else if (/(family|given|middle)\s*name|sobrenome|nome\s+(de|do)\s+(família|familia)/.test(haystack)) {
+      f.rule_id = "SENIOR_NAME_INCONSISTENCY";
+    } else if (/edition|edição|edicao|version/.test(haystack)) {
+      f.rule_id = "SENIOR_FORM_EDITION_QUESTION";
+    } else if (/address|endereço|endereco|mailing/.test(haystack)) {
+      f.rule_id = "SENIOR_ADDRESS_INCONSISTENCY";
+    } else {
+      f.rule_id = "SENIOR_DATA_INCONSISTENCY";
+    }
+  }
+
   findings = findings.concat(seniorFindings);
   const findingsBeforeAdversarial = findings.length;
 

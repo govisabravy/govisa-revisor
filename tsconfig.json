@@ -20,5 +20,5 @@
     }
   },
   "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
-  "exclude": ["node_modules"]
+  "exclude": ["node_modules", "scripts/e2e-prod.ts", "scripts/replay-rules.ts", "scripts/replay-findings-json.ts", "scripts/replay-all.ts", "scripts/replay-batch.ts", "scripts/cross-feedback-replay.ts"]
 }
