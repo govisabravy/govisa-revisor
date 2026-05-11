@@ -280,6 +280,20 @@ REGRAS CRÍTICAS:
 8. Tier: tier1_filing (rejeição imediata), tier2_substantivo (afeta mérito), tier3_estrategico (estratégia/RFE).
 9. Output: SOMENTE JSON válido conforme schema indicado.
 
+ARMADILHAS DE FALSO POSITIVO (calibração rodada 5, baseada em feedback do time):
+
+A. **A-Number vs USCIS Number do advogado**: na PRIMEIRA PÁGINA de CADA formulário USCIS (I-914, I-914A, I-192, I-765, G-28), aparecem os dados do ADVOGADO (nome, USCIS Number, Bar License). Esses dados pertencem ao advogado Jeffrey Weingrad, NÃO ao cliente. O A-Number do cliente fica em outra seção do form (geralmente página 2+). Se você vir um número USCIS que difere entre forms, verifique se um deles é o número do advogado antes de emitir finding sobre inconsistência. NÃO emita findings de A-Number/SSN/USCIS Number inconsistente quando a divergência for entre o número do advogado (página 1) e o número do cliente (páginas internas).
+
+B. **Estrutura do I-914A**: o formulário I-914A tem uma peculiaridade: a PRIMEIRA PÁGINA traz os dados do APLICANTE PRINCIPAL (nome, DOB, A-Number do principal), e somente a PÁGINA 3 traz os dados do DEPENDENTE (family member). NÃO compare dados da página 1 do I-914A com o passaporte do dependente. A data de nascimento na pág. 1 do I-914A é do principal, não do dep.
+
+C. **Cross-subject**: quando o caso tem múltiplos dependentes (dep_1, dep_2, dep_3...), cada um tem seu PRÓPRIO I-914A, I-765 e G-28. NÃO cruze dados de um dependente com formulários de OUTRO dependente. Compare cada dependente apenas com seus próprios formulários. Se um passaporte pertence a dep_2, não o cruze com o I-914A de dep_1.
+
+D. **Relação familiar**: dependentes podem ser filhos (child) OU cônjuge (spouse). Verifique o campo "relationship_to_principal" antes de emitir CSPA age-out risk. CSPA só se aplica a filhos, NUNCA a cônjuges. Se o dependente é marcado como "spouse", não emita CSPA.
+
+E. **Ausência de dados**: quando um campo extraído é null, isso pode significar que o extrator falhou (não que o dado está ausente no PDF original). NÃO emita findings sobre "dados faltando" baseado apenas em campos null. Só emita se houver evidência positiva de inconsistência.
+
+F. **Comprovante de residência**: um único comprovante de residência cobre toda a família (principal + dependentes moram juntos). NÃO sinalize ausência de comprovante para dependentes individualmente.
+
 Use o raciocínio passo a passo (extended thinking) antes de produzir o JSON final.`;
 
 function redactForSummary(form: any): any {

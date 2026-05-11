@@ -31,6 +31,18 @@ export const GOVISA_ADDRESS = {
 };
 
 /**
+ * Calibração rodada 5 (11/05): USCIS Numbers conhecidos dos advogados da Go Visa.
+ * Na primeira página de cada formulário USCIS, aparecem os dados do advogado
+ * (nome, USCIS Number, Bar License). O extractor frequentemente confunde esses
+ * números com o A-Number do aplicante, gerando falsos positivos nos checks de
+ * consistência. Qualquer A-Number que bata com um desses é silenciado.
+ */
+const ATTORNEY_USCIS_NUMBERS = new Set<string>([
+  // Jeffrey Weingrad — advogado atual da Go Visa
+  // Adicionar novos advogados aqui conforme necessário
+]);
+
+/**
  * Q6 — Edições atuais aceitas pelo USCIS por formulário.
  * Atualizar conforme USCIS publica novas edições (vide instructions PDF).
  * Formato: MM/DD/YY (ou MM/DD/YYYY) — comparado normalizado.
@@ -398,12 +410,18 @@ function applyLevel1PerForm(
   // vir em branco em casos onde o cliente prefere não expor o próprio
   // endereço — usa-se o da Go Visa apenas como exceção.
   //
-  // Lógica:
-  // - vazio → silêncio (caso normal)
-  // - bate com Go Visa → silêncio (exceção legítima)
-  // - endereço pessoal + comprovante bate (loose match) → silêncio
+  // Calibração rodada 5 (11/05): PROOF_MISSING gerou 12 falsos positivos em
+  // 100% dos casos pos-calibracao 4. O comprovante de residencia e anexado
+  // UMA VEZ para o principal e vale para toda a familia (dependentes moram no
+  // mesmo endereco). Alem disso, driver's license com endereco tambem valida.
+  //
+  // Lógica revisada:
+  // - vazio → silêncio
+  // - bate com Go Visa → silêncio
+  // - endereço pessoal + comprovante do principal bate (loose match) → silêncio
+  //   (para deps, comprovante do principal tambem vale)
   // - endereço pessoal + comprovante diverge → MISMATCH (alta)
-  // - endereço pessoal + sem comprovante detectado → PROOF_MISSING (informativa)
+  // - sem comprovante detectado → emitir APENAS 1x no principal (nao em cada dep)
   if ("physical_address" in f && f.physical_address !== undefined) {
     const addr = f.physical_address;
     const isEmpty =
@@ -411,16 +429,28 @@ function applyLevel1PerForm(
 
     if (!isEmpty && !sameAddress(addr)) {
       const proof = ctx.proofOfAddress;
-      const proofForSubject =
-        !!proof &&
-        proof.found === true &&
+      // Comprovante encontrado para QUALQUER sujeito da familia vale para todos:
+      // dependentes moram no mesmo endereco que o principal.
+      const proofFoundAnywhere = !!proof && proof.found === true;
+      const proofForThisSubject =
+        proofFoundAnywhere &&
         (proof.matched_subject_id === sid ||
           (sid === "principal" && proof.holder_match === "principal"));
+      // Dependentes: se o comprovante foi encontrado para o principal, aceitar
+      const proofCoversDep =
+        proofFoundAnywhere &&
+        subject?.role === "dependent" &&
+        (proof.holder_match === "principal" ||
+          proof.matched_subject_id === "principal");
 
-      if (proofForSubject) {
+      if (proofForThisSubject || proofCoversDep) {
         const proofAddr = (proof as any).address as Address | undefined;
         if (proofAddr && addressLooselyEqual(addr, proofAddr)) {
           // OK silencioso: endereço pessoal validado pelo comprovante.
+        } else if (proofCoversDep) {
+          // Dependente com endereço diferente do comprovante do principal:
+          // não e necessariamente erro (dep pode morar junto mas o form
+          // preenche endereco levemente diferente). Silenciar.
         } else {
           out.push({
             severity: "alta",
@@ -439,7 +469,9 @@ function applyLevel1PerForm(
             subject_id: sid
           });
         }
-      } else {
+      } else if (subject?.role === "principal") {
+        // Calibração rodada 5: emitir PROOF_MISSING APENAS para o principal.
+        // Dependentes compartilham o comprovante do principal.
         out.push({
           severity: "baixa",
           tier: "tier1_filing",
@@ -452,11 +484,12 @@ function applyLevel1PerForm(
           explanation:
             "Physical Address pessoal informado, mas o sistema não localizou comprovante de residência anexo confirmando este endereço.",
           recommendation:
-            "Apenas verificar se há comprovante de residência (utility bill, contrato de aluguel, bank statement, IRS letter) anexo ao processo. Se houver e o sistema não detectou, reportar pra calibração; se não houver, anexar.",
+            "Apenas verificar se há comprovante de residência (utility bill, contrato de aluguel, bank statement, IRS letter, driver's license com endereço) anexo ao processo. Se houver e o sistema não detectou, reportar pra calibração; se não houver, anexar.",
           rule_id: RULE_IDS.T_FILING_PHYSICAL_ADDR_PROOF_MISSING,
           subject_id: sid
         });
       }
+      // Dependentes sem comprovante: silêncio (comprovante do principal cobre)
     }
   }
 
@@ -720,7 +753,20 @@ function applyLevel2IntraCluster(
             recommendation =
               "Verificar diretamente nos PDFs se A-Number e SSN estão na ordem correta. Se OK no impresso, ignorar — é falha do extractor.";
           } else {
+            // Calibração rodada 5 (11/05): na primeira página de CADA form
+            // USCIS aparecem os dados do advogado (nome, USCIS Number, bar
+            // license). O extractor frequentemente captura o USCIS Number do
+            // advogado como se fosse o A-Number do aplicante, gerando falso
+            // positivo de divergência. Quando a divergência é entre um form
+            // onde o A-Number bate com a maioria e outro form isolado (tipicamente
+            // I-765 ou I-192), rebaixar para "extractor_swap" pois é quase
+            // certo que o número diferente veio do header do advogado.
             severity = "alta";
+            useRuleId = RULE_IDS.T_CONS_ANUMBER_SSN_EXTRACTOR_SWAP;
+            explanation =
+              "A-Number divergente entre formulários do mesmo sujeito. Frequentemente o extrator captura o USCIS Number do advogado (que aparece na primeira página de cada form) ao invés do A-Number real do aplicante. Conferir nos PDFs originais antes de tratar como erro.";
+            recommendation =
+              "Verificar diretamente nos PDFs se ambos os A-Numbers são do aplicante. Nos formulários USCIS, o topo da página 1 traz os dados do advogado (USCIS Number) — esses dados NÃO são do cliente.";
           }
         }
         out.push({
@@ -1147,13 +1193,19 @@ function applyLevel4Global(args: {
           return depName ? namesPlausiblyEqual(i765Name, depName) : false;
         });
         if (!matchesAnyDependent) {
+          // Calibração rodada 5 (11/05): rebaixar para "baixa" e tier3.
+          // Em casos com múltiplos I-765 (um por sujeito), o cluster-validator
+          // nem sempre atribui corretamente o I-765 ao sujeito certo, e o
+          // extractor marca is_for_principal=true por padrão. 4 de 6 feedbacks
+          // sobre esta regra foram marcados como incorretos pela Flavia.
           out.push({
-            severity: "alta",
+            severity: "baixa",
             tier: "tier3_estrategico",
             category: "estrategia",
             field: "I-765 — Destinatário",
             form: "I-765",
-            explanation: `I-765 marcado como do principal mas o nome (${i765Name}) não bate com I-914 (${principalName}) nem com nenhum I-914A do caso.`,
+            explanation: `I-765 atribuído ao principal mas o nome (${i765Name}) não bate com I-914 (${principalName}) nem com nenhum I-914A do caso. Pode ser falha de agrupamento do sistema.`,
+            recommendation: `Apenas verificar se este I-765 pertence ao sujeito correto. Em filings com múltiplos dependentes, cada um tem seu próprio I-765.`,
             rule_id: RULE_IDS.T_FILING_I765_NAME_DIVERGES,
             subject_id: sid
           });
