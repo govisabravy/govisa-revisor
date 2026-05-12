@@ -102,7 +102,26 @@ export default function NewReview() {
       if (err?.name === "AbortError") {
         setError("Revisão interrompida pelo usuário.");
       } else {
-        setError(err?.message ?? "Erro ao revisar processo.");
+        const msg = String(err?.message ?? "");
+        // Safari retorna "Load failed", Chrome retorna "Failed to fetch"
+        // quando há falha de rede, timeout, ou o servidor desconecta.
+        const isNetworkError =
+          msg === "Load failed" ||
+          msg === "Failed to fetch" ||
+          msg.includes("NetworkError") ||
+          msg.includes("network") ||
+          msg.includes("timeout") ||
+          msg.includes("ERR_CONNECTION") ||
+          msg === "";
+        if (isNetworkError) {
+          setError(
+            "Falha na conexão com o servidor. Isso pode acontecer em PDFs muito grandes ou " +
+            "quando a rede está instável. Tente novamente. Se o problema persistir, " +
+            "verifique sua conexão de internet ou entre em contato com o suporte."
+          );
+        } else {
+          setError(msg || "Erro ao revisar processo.");
+        }
       }
     } finally {
       setLoading(false);
@@ -261,8 +280,14 @@ export default function NewReview() {
               </div>
             )}
             {error && (
-              <div className="bg-red-50 border border-red-300 rounded-xl p-4 text-red-800 text-sm">
-                {error}
+              <div className="bg-red-50 border border-red-300 rounded-xl p-4 text-red-800 text-sm flex items-start justify-between gap-3">
+                <span>{error}</span>
+                <button
+                  onClick={() => setError(null)}
+                  className="shrink-0 text-red-500 hover:text-red-700 text-xs font-semibold underline"
+                >
+                  Fechar
+                </button>
               </div>
             )}
           </>

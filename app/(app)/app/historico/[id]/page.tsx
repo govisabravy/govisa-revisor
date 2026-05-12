@@ -50,7 +50,17 @@ export default function HistoricoDetailPage() {
         setRerunBusy(false);
       }
     } catch (err) {
-      setRerunError(err instanceof Error ? err.message : String(err));
+      const msg = err instanceof Error ? err.message : String(err);
+      const isNetworkError =
+        msg === "Load failed" ||
+        msg === "Failed to fetch" ||
+        msg.includes("NetworkError") ||
+        msg.includes("timeout");
+      setRerunError(
+        isNetworkError
+          ? "Falha na conexão com o servidor. A reexecução pode ter iniciado no backend. Verifique o histórico em alguns minutos."
+          : msg
+      );
       setRerunBusy(false);
     }
   }
