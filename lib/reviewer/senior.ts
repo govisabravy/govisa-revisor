@@ -506,7 +506,7 @@ Máximo 8 findings. Não emita findings se não houver evidência clara nos dado
         attempts++;
         const params: any = {
           model: MODEL,
-          max_tokens: useThinking ? 8192 : 12000,
+          max_tokens: useThinking ? 16000 : 12000,
           system: [
             {
               type: "text",
@@ -522,7 +522,7 @@ Máximo 8 findings. Não emita findings se não houver evidência clara nos dado
           ]
         };
         if (useThinking) {
-          params.thinking = { type: "adaptive" } as any;
+          params.thinking = { type: "enabled", budget_tokens: 10000 } as any;
         }
         return client.messages.create(params);
       });
@@ -831,7 +831,7 @@ Use a tool report_adversarial_decisions e devolva exatamente uma decisão por fi
         attempts++;
         const params: any = {
           model: MODEL,
-          max_tokens: useThinking ? 8192 : 12000,
+          max_tokens: useThinking ? 16000 : 12000,
           system: [
             {
               type: "text",
@@ -856,7 +856,7 @@ Use a tool report_adversarial_decisions e devolva exatamente uma decisão por fi
         };
         if (useThinking) {
           // tool_choice: "auto" porque Anthropic não permite thinking + tool_choice forçado.
-          params.thinking = { type: "adaptive" } as any;
+          params.thinking = { type: "enabled", budget_tokens: 10000 } as any;
           params.tool_choice = { type: "auto" } as any;
         } else {
           // Sem thinking podemos forçar tool_use.

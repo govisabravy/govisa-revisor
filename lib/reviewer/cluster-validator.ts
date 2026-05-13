@@ -509,7 +509,7 @@ Use a tool ${TOOL_NAME} para reportar correções, novos sujeitos, órfãos e am
       return client.messages.create({
         model: MODEL,
         max_tokens: 16000,
-        thinking: { type: "adaptive" } as any,
+        thinking: { type: "enabled", budget_tokens: 10000 } as any,
         system: [
           {
             type: "text",
