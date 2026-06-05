@@ -482,7 +482,8 @@ const FORM_INPUT_SCHEMAS: Record<string, any> = {
       eligibility_category: { type: ["string", "null"] },
       last_employer: { type: ["string", "null"] },
       is_for_principal: { type: ["boolean", "null"] },
-      category_valid_for_t_visa: { type: ["boolean", "null"] }
+      category_valid_for_t_visa: { type: ["boolean", "null"] },
+      attorney_bar_number: { type: ["string", "null"] }
     },
     required: ["form", "person"]
   },
@@ -493,6 +494,7 @@ const FORM_INPUT_SCHEMAS: Record<string, any> = {
       meta: META_SCHEMA,
       attorney_name: { type: ["string", "null"] },
       attorney_firm: { type: ["string", "null"] },
+      attorney_bar_number: { type: ["string", "null"] },
       attorney_address: ADDRESS_SCHEMA,
       attorney_signature: SIGNATURE_SCHEMA,
       client_name: { type: ["string", "null"] },
@@ -899,11 +901,13 @@ const FORM_HINTS: Record<string, string> = {
 - "part2_filled" = true se QUALQUER campo de Part 2 (Officer Name, Agency, Title, Signature, etc.) estiver preenchido; false se estiver totalmente em branco; null se ambíguo.
 - "part2_fields_filled" = lista de campos de Part 2 que você viu preenchidos (ex: ["Officer Full Name", "Agency Name"]).`,
   "I-192": `Para "grounds_of_inadmissibility" liste os motivos marcados no form (ex: "INA 212(a)(6)(A) - entered without inspection", "INA 212(a)(9)(B) - unlawful presence", etc.).`,
-  "I-765": `Categorias válidas em T-visa:
+  "I-765": `"attorney_bar_number" = Bar Number do advogado no rodapé da pág.1 ("Attorney State Bar Number (if applicable)"). Apenas dígitos. NÃO confundir com o A-Number do cliente.
+Categorias válidas em T-visa:
 - (c)(25) = T-1 principal; (a)(16) = T-1 ajustando; (c)(25) também cobre alguns; para T-2/3/4/5 derivativos os códigos variam.
 - "is_for_principal" = true se o I-765 é do aplicante principal (T-1), false se é de derivativo.
 - "category_valid_for_t_visa" = true se a categoria informada faz sentido para T-visa; false se é categoria errada (ex: c(8) asylum).`,
-  "G-28": `ATENÇÃO G-28: precisa assinatura TANTO do advogado QUANTO do cliente. Verifique ambas.`
+  "G-28": `ATENÇÃO G-28: precisa assinatura TANTO do advogado QUANTO do cliente. Verifique ambas.
+- "attorney_bar_number" = o Bar Number / State Bar Number do advogado (campo "Bar Number (if applicable)" ou "State Bar Number"). Apenas os dígitos.`
 };
 
 export async function extractFormFromPdf(args: {
@@ -1295,6 +1299,54 @@ ${expected.length > 0 ? `Pessoas esperadas no caso (cruze holder_name com elas):
     });
   } catch (err) {
     console.error("Falha analisando proof_of_address:", String((err as any)?.message ?? err).slice(0, 200));
+    return null;
+  }
+}
+
+export interface FinalSignatureCheck {
+  signed: boolean | null;
+  signer_name: string | null;
+  bar_number_seen: string | null;
+}
+
+const FINAL_SIG_INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    signed: { type: ["boolean", "null"] },
+    signer_name: { type: ["string", "null"] },
+    bar_number_seen: { type: ["string", "null"] }
+  },
+  required: ["signed"]
+};
+
+const FINAL_SIG_SYSTEM = `Você analisa a página de "Final Considerations" (carta de encerramento do advogado) de um processo USCIS montado pela Go Visa Law Firm.
+
+Essa página é assinada PELO ADVOGADO (ex: Jeffrey Weingrad). Sua tarefa: verificar se há ASSINATURA do advogado na página.
+
+REGRAS:
+- signed = true se houver uma assinatura manuscrita/imagem de assinatura do advogado no rodapé; false se o espaço de assinatura estiver em branco; null se não der pra avaliar.
+- signer_name = nome impresso do signatário (ex: "Jeffrey Weingrad"), se visível.
+- bar_number_seen = o Bar Number do advogado que aparecer na página (apenas dígitos), se houver.
+- Use a VISÃO no PDF anexo para enxergar a assinatura.`;
+
+export async function checkFinalConsiderationsSignature(
+  pdfBase64: string
+): Promise<FinalSignatureCheck | null> {
+  try {
+    return await callToolWithDocument<FinalSignatureCheck>({
+      systemBlocks: [{ type: "text", text: FINAL_SIG_SYSTEM, cacheControl: true }],
+      pdfBase64,
+      userText:
+        "Verifique se a página de Final Considerations tem a assinatura do advogado. Use a tool report_final_signature.",
+      toolName: "report_final_signature",
+      toolDescription:
+        "Reporta se a página de Final Considerations tem assinatura do advogado, o nome do signatário e o bar number visível.",
+      inputSchema: FINAL_SIG_INPUT_SCHEMA,
+      maxTokens: 800,
+      operation: "checkFinalConsiderationsSignature"
+    });
+  } catch (err) {
+    console.error("Falha checando assinatura final:", String((err as any)?.message ?? err).slice(0, 200));
     return null;
   }
 }

@@ -17,10 +17,12 @@ import {
   analyzeI914BQualification,
   checkCertifiedTranslations,
   analyzeProofOfAddress,
+  checkFinalConsiderationsSignature,
   type PassportSignatureCheck,
   type StructureDocument
 } from "./claude";
 import { applyGovisaRules, summarize } from "./rules";
+import { RULE_IDS } from "./rule_ids";
 import { extractI360FromText, extractVawaStoryFromText, applyVawaRules } from "./vawa";
 import {
   extractI918FromText,
@@ -267,6 +269,69 @@ function groupFormsBySubject(forms: FormData[]): Record<string, FormData[]> {
     const sid = (f as any)._subject_id ?? "principal";
     if (!out[sid]) out[sid] = [];
     out[sid].push(f);
+  }
+  return out;
+}
+
+// Mapeia uma linha da Table of Contents para o kind de documento detectável.
+// Ordem importa: variantes mais específicas (I-914A/B) antes do I-914 base.
+const TOC_SECTION_MAP: Array<{ re: RegExp; kind: string; label: string }> = [
+  { re: /cover\s*letter/i, kind: "cover_letter", label: "Cover Letter" },
+  { re: /i-?914b/i, kind: "I-914B", label: "Form I-914B" },
+  { re: /i-?914a/i, kind: "I-914A", label: "Form I-914A" },
+  { re: /i-?914(?![ab0-9])/i, kind: "I-914", label: "Form I-914" },
+  { re: /i-?192/i, kind: "I-192", label: "Form I-192" },
+  { re: /i-?765/i, kind: "I-765", label: "Form I-765" },
+  { re: /g-?28/i, kind: "G-28", label: "Form G-28" },
+  { re: /identification/i, kind: "identification", label: "Identification Documents" },
+  { re: /country\s*condition/i, kind: "country_conditions", label: "General Country Conditions" },
+  { re: /witness/i, kind: "witness_statements", label: "Witness Statements" },
+  { re: /medical|psycholog/i, kind: "medical_records", label: "Medical and Psychological Records" },
+  { re: /final\s*consideration/i, kind: "final", label: "Final Considerations" }
+];
+
+/**
+ * Requisição 05/06: verificar se cada seção listada na Table of Contents tem
+ * a divisória/seção correspondente detectada no processo. Retorna findings
+ * (severidade média) pra cada seção da ToC sem documento detectado.
+ */
+function checkTableOfContents(pages: string[], docs: StructureDocument[]): Finding[] {
+  const out: Finding[] = [];
+  // Localiza a página da ToC (geralmente nas primeiras).
+  const tocPageIdx = pages
+    .slice(0, 8)
+    .findIndex((p) => /table\s+of\s+contents/i.test(p));
+  if (tocPageIdx === -1) return out; // sem ToC detectável → não acusa
+
+  // Junta a página da ToC + a próxima (a lista pode transbordar).
+  const tocText = [pages[tocPageIdx], pages[tocPageIdx + 1] ?? ""].join("\n");
+  const lines = tocText
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => /^\d{1,2}[.\)]/.test(l)); // só linhas numeradas "1. ..." / "1) ..."
+  if (lines.length === 0) return out;
+
+  const detectedKinds = new Set<string>(docs.map((d) => d.kind));
+  const seen = new Set<string>();
+  for (const line of lines) {
+    const match = TOC_SECTION_MAP.find((s) => s.re.test(line));
+    if (!match || seen.has(match.kind)) continue;
+    seen.add(match.kind);
+    if (!detectedKinds.has(match.kind)) {
+      out.push({
+        severity: "media",
+        tier: "tier1_filing",
+        category: "suporte_documental",
+        field: `Divisória/seção ausente: ${match.label}`,
+        form: null,
+        expected: `Seção "${match.label}" presente (consta na Table of Contents)`,
+        found: "Seção/divisória não localizada no processo",
+        explanation: `A Table of Contents lista "${match.label}", mas o sistema não localizou essa seção/divisória no documento. Verificar se a divisória (contracapa) foi incluída.`,
+        recommendation: `Conferir se a seção "${match.label}" e sua divisória estão no processo na ordem da Table of Contents.`,
+        rule_id: RULE_IDS.T_FILING_TOC_SECTION_MISSING,
+        subject_id: "principal"
+      });
+    }
   }
   return out;
 }
@@ -582,17 +647,28 @@ export async function reviewProcess(input: ReviewInput): Promise<ReviewOutput> {
   // Proof of address (rodada APÓS extrações pra ter expected_holder_names)
   // ---------------------------------------------------------------------------
   let proofOfAddress: ProofOfAddressAnalysis | null = null;
-  if (proofSubdocs.length > 0) {
+  {
     const expectedHolders = subjects.map((s) => ({
       subject_id: s.id,
       display_name: s.display_name
     }));
-    const proofDoc = proofSubdocs[0];
-    const proofB64 = await capped(input.buffer, proofDoc.startPage, proofDoc.endPage, 6);
-    proofOfAddress = await analyzeProofOfAddress({
-      pdfBase64: proofB64,
-      expectedHolderNames: expectedHolders
-    });
+    // Requisição 05/06: o comprovante de residência frequentemente está DENTRO
+    // da seção Identification (utility bill / driver's license grudados). Além
+    // do subdoc proof_of_address, procuramos também na Identification. Paramos
+    // na primeira fonte com comprovante encontrado (found=true).
+    const proofSources: SubDocument[] = [...proofSubdocs, ...idSubdocs];
+    for (const src of proofSources.slice(0, 2)) {
+      const b64 = await capped(input.buffer, src.startPage, src.endPage, 6);
+      const res = await analyzeProofOfAddress({
+        pdfBase64: b64,
+        expectedHolderNames: expectedHolders
+      });
+      if (res && res.found) {
+        proofOfAddress = res;
+        break;
+      }
+      if (res && !proofOfAddress) proofOfAddress = res; // fallback (não encontrado)
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -756,6 +832,40 @@ export async function reviewProcess(input: ReviewInput): Promise<ReviewOutput> {
       return true;
     });
     findings = findings.concat(nonTSpecific);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Checks estruturais (Requisição 05/06): divisórias da ToC + assinatura final
+  // ---------------------------------------------------------------------------
+  try {
+    findings = findings.concat(checkTableOfContents(pdf.pages, docs));
+  } catch (err) {
+    console.error("checkTableOfContents falhou:", String((err as any)?.message ?? err).slice(0, 150));
+  }
+
+  const finalSubdoc = subdocs.find((s) => s.kind === "final");
+  if (finalSubdoc) {
+    try {
+      const finalSig = await checkFinalConsiderationsSignature(finalSubdoc.base64);
+      if (finalSig && finalSig.signed === false) {
+        findings.push({
+          severity: "alta",
+          tier: "tier1_filing",
+          category: "assinatura",
+          field: "Assinatura do advogado — Final Considerations",
+          form: null,
+          expected: "Página de Final Considerations assinada pelo advogado",
+          found: "Assinatura do advogado não localizada na página de Final Considerations",
+          explanation:
+            "A página de Final Considerations (carta de encerramento) deve ser assinada pelo advogado, mas o sistema não localizou a assinatura.",
+          recommendation: "Conferir/incluir a assinatura do advogado na página de Final Considerations antes do filing.",
+          rule_id: RULE_IDS.T_FILING_FINAL_ATTORNEY_SIG_MISSING,
+          subject_id: "principal"
+        });
+      }
+    } catch (err) {
+      console.error("checkFinalConsiderationsSignature falhou:", String((err as any)?.message ?? err).slice(0, 150));
+    }
   }
 
   // ---------------------------------------------------------------------------

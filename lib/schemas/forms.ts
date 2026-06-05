@@ -163,7 +163,9 @@ export const I765Schema = z.object({
   eligibility_category: z.string().nullable().optional(),
   last_employer: z.string().nullable().optional(),
   is_for_principal: z.boolean().nullable().optional(),
-  category_valid_for_t_visa: z.boolean().nullable().optional()
+  category_valid_for_t_visa: z.boolean().nullable().optional(),
+  // Bar Number do advogado/representante (rodapé da pág.1: "Attorney State Bar Number").
+  attorney_bar_number: z.string().nullable().optional()
 });
 
 export const G28Schema = z.object({
@@ -171,6 +173,7 @@ export const G28Schema = z.object({
   meta: FormMetaSchema.optional(),
   attorney_name: z.string().nullable().optional(),
   attorney_firm: z.string().nullable().optional(),
+  attorney_bar_number: z.string().nullable().optional(),
   attorney_address: AddressSchema.optional(),
   attorney_signature: SignatureSchema.optional(),
   client_name: z.string().nullable().optional(),

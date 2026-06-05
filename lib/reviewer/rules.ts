@@ -49,6 +49,18 @@ const ATTORNEY_USCIS_NUMBERS = new Set<string>([
 ]);
 
 /**
+ * Requisição 05/06: o Bar Number do advogado da Go Visa (Jeffrey Weingrad) deve
+ * ser SEMPRE 5794276 em todos os documentos. Atualizar se trocar de advogado.
+ */
+const EXPECTED_ATTORNEY_BAR = "5794276";
+
+/** Só dígitos, sem zeros à esquerda — pra comparar bar numbers de forma tolerante. */
+function digitsOnly(raw?: string | null): string {
+  if (!raw) return "";
+  return String(raw).replace(/[^0-9]/g, "").replace(/^0+/, "");
+}
+
+/**
  * Q6 — Edições atuais aceitas pelo USCIS por formulário.
  * Atualizar conforme USCIS publica novas edições (vide instructions PDF).
  * Formato: MM/DD/YY (ou MM/DD/YYYY) — comparado normalizado.
@@ -1087,6 +1099,39 @@ function applyLevel4Global(args: {
 
   // Reference person para usar em comparações com a story (ainda olhamos o I-914 do principal)
   const reference: Person | undefined = i914?.person;
+
+  // ---- Bar Number do advogado (Requisição 05/06) ----
+  // Deve ser 5794276 em todos os documentos. Coleta de G-28 e I-765.
+  {
+    const barOccurrences: Array<{ form: string; value: string }> = [];
+    for (const g of g28s) {
+      const v = digitsOnly((g as any).attorney_bar_number);
+      if (v) barOccurrences.push({ form: "G-28", value: v });
+    }
+    for (const f of i765s) {
+      const v = digitsOnly((f as any).attorney_bar_number);
+      if (v) barOccurrences.push({ form: "I-765", value: v });
+    }
+    const expected = digitsOnly(EXPECTED_ATTORNEY_BAR);
+    const divergent = barOccurrences.filter((o) => o.value !== expected);
+    if (divergent.length > 0) {
+      const found = divergent.map((o) => `${o.value} (${o.form})`).join(", ");
+      out.push({
+        severity: "alta",
+        tier: "tier1_filing",
+        category: "divergencia",
+        field: "Bar Number do advogado",
+        form: Array.from(new Set(divergent.map((o) => o.form))).join(", "),
+        expected: `${EXPECTED_ATTORNEY_BAR} (Jeffrey Weingrad)`,
+        found,
+        explanation:
+          `O Bar Number do advogado deve ser ${EXPECTED_ATTORNEY_BAR} em todos os documentos, mas foi encontrado valor divergente. Conferir se o número está correto no(s) formulário(s).`,
+        recommendation: `Corrigir o Bar Number do advogado para ${EXPECTED_ATTORNEY_BAR} nos documentos divergentes.`,
+        rule_id: RULE_IDS.T_FILING_ATTORNEY_BAR_DIVERGE,
+        subject_id: principalSubject?.id ?? null
+      });
+    }
+  }
 
   // ---- Draft mode notice (assinaturas) ----
   if (isDraft) {

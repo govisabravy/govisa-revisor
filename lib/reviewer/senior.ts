@@ -294,6 +294,8 @@ E. **Ausência de dados**: quando um campo extraído é null, isso pode signific
 
 F. **Comprovante de residência**: um único comprovante de residência cobre toda a família (principal + dependentes moram juntos). NÃO sinalize ausência de comprovante para dependentes individualmente.
 
+G. **Relationship × idade — NÃO reclassifique a relação (caso Anderson Ricardo, Flavia 05/06)**: confie no campo "relationship_to_principal" como está extraído de cada I-914A. NÃO conclua que a relação está errada com base na idade/DOB. Quando há MAIS DE UM dependente (ex: um cônjuge e um filho) e a relação parece incompatível com a idade (ex: alguém marcado "child" que é mais velho que o principal), isso quase sempre significa que os dependentes foram TROCADOS na associação dos formulários (o I-914A de um dep foi associado ao outro) — NÃO que o filing esteja errado. Nesse caso NÃO emita finding crítico afirmando que a relação está classificada errada. No máximo, um aviso leve (severidade baixa) para "conferir qual I-914A pertence a qual dependente". O PDF normalmente está correto; o erro, quando existe, é de associação interna, não do filing.
+
 Use o raciocínio passo a passo (extended thinking) antes de produzir o JSON final.`;
 
 function redactForSummary(form: any): any {

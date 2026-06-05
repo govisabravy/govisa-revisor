@@ -181,7 +181,15 @@ export const RULE_IDS = {
   // Cliente VAWA/U-visa tem A-number preenchido em algum form mas nao foi
   // detectada carta de imigração entre os documentos. Sinaliza pra cruzar
   // com EOIR antes do filing.
-  IMM_EWI_A_NUMBER_NO_IMMIGRATION_DOC: "IMM_EWI_A_NUMBER_NO_IMMIGRATION_DOC"
+  IMM_EWI_A_NUMBER_NO_IMMIGRATION_DOC: "IMM_EWI_A_NUMBER_NO_IMMIGRATION_DOC",
+
+  // ----- Requisição 05/06 (Flavia/Yuri) -----
+  // Bar Number do advogado deve ser o esperado (5794276) em todos os documentos.
+  T_FILING_ATTORNEY_BAR_DIVERGE: "T_FILING_ATTORNEY_BAR_DIVERGE",
+  // Página de Final Considerations sem assinatura do advogado.
+  T_FILING_FINAL_ATTORNEY_SIG_MISSING: "T_FILING_FINAL_ATTORNEY_SIG_MISSING",
+  // Seção listada na Table of Contents sem divisória/seção detectada no processo.
+  T_FILING_TOC_SECTION_MISSING: "T_FILING_TOC_SECTION_MISSING"
 } as const;
 
 export type RuleId = keyof typeof RULE_IDS;

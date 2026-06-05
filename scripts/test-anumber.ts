@@ -65,6 +65,23 @@ async function main() {
     }
   }
 
+  // ---- Novos checks (Requisição 05/06) ----
+  console.log("\n===== BAR NUMBER EXTRAÍDO ===== (esperado 5794276)");
+  for (const f of (result.debug.extracted_forms ?? []) as any[]) {
+    if (f.form === "G-28" || f.form === "I-765") {
+      console.log(`  ${f.form}: attorney_bar_number=${f.attorney_bar_number ?? "null"}`);
+    }
+  }
+  console.log("\n===== FINDINGS NOVOS (bar/final/toc/address) =====");
+  const newOnes = (result.report.findings ?? []).filter((x: any) =>
+    /ATTORNEY_BAR|FINAL_ATTORNEY_SIG|TOC_SECTION|PHYSICAL_ADDR/.test(x.rule_id ?? "")
+  );
+  if (newOnes.length === 0) console.log("  (nenhum — esperado se o processo está completo/correto)");
+  for (const x of newOnes as any[]) {
+    console.log(`  [${x.severity}] ${x.rule_id} — ${x.field}`);
+    if (x.found) console.log(`     found: ${x.found}`);
+  }
+
   console.log("\n===== RESUMO =====");
   console.log(`Forms: ${result.report.forms_detected.join(", ")}`);
   console.log(`Subjects: ${(result.report.subjects ?? []).map((s: any) => `${s.role}:${s.display_name}`).join(" | ")}`);
