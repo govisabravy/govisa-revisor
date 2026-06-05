@@ -506,10 +506,12 @@ Use a tool ${TOOL_NAME} para reportar correções, novos sujeitos, órfãos e am
   try {
     res = await callWithRetry(() => {
       attempts++;
-      return client.messages.create({
+      const params: any = {
         model: MODEL,
         max_tokens: 16000,
-        thinking: { type: "enabled", budget_tokens: 10000 } as any,
+        // claude-opus-4-7 só aceita adaptive thinking; "enabled"+budget_tokens dá 400.
+        thinking: { type: "adaptive" } as any,
+        output_config: { effort: "high" } as any,
         system: [
           {
             type: "text",
@@ -534,7 +536,8 @@ Use a tool ${TOOL_NAME} para reportar correções, novos sujeitos, órfãos e am
             content: [{ type: "text", text: userText }]
           }
         ]
-      });
+      };
+      return client.messages.create(params);
     });
   } catch (err) {
     caughtErr = err;

@@ -70,7 +70,7 @@ export async function extractI360FromText(args: { text: string; pdfBase64?: stri
   "person": {
     "family_name": string|null, "given_name": string|null, "middle_name": string|null, "other_names": [],
     "date_of_birth": string|null, "country_of_birth": string|null, "country_of_citizenship": string|null,
-    "gender": string|null, "marital_status": string|null, "a_number": string|null, "uscis_online_account": string|null,
+    "gender": string|null, "marital_status": string|null, "a_number": string|null, "a_numbers_seen": [{"value": string, "page": number|null}], "uscis_online_account": string|null,
     "ssn": string|null, "passport_number": string|null, "passport_country": string|null,
     "passport_issue_date": string|null, "passport_expiration_date": string|null, "passport_signed": null
   },

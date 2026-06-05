@@ -615,7 +615,9 @@ Cada predição deve incluir trigger_findings com referência aos rule_ids/campo
       };
       if (useThinking) {
         // tool_choice: "auto" porque Anthropic não permite thinking + tool_choice forçado.
-        params.thinking = { type: "enabled", budget_tokens: 10000 } as any;
+        // claude-opus-4-7 só aceita adaptive thinking; "enabled"+budget_tokens dá 400.
+        params.thinking = { type: "adaptive" } as any;
+        params.output_config = { effort: "high" } as any;
         params.tool_choice = { type: "auto" } as any;
       } else {
         params.tool_choice = { type: "tool", name: LLM_TOOL_NAME } as any;

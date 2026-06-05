@@ -324,6 +324,17 @@ const PERSON_SCHEMA = {
     gender: { type: ["string", "null"] },
     marital_status: { type: ["string", "null"] },
     a_number: { type: ["string", "null"] },
+    a_numbers_seen: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          value: { type: "string" },
+          page: { type: ["string", "number", "null"] }
+        },
+        required: ["value"]
+      }
+    },
     uscis_online_account: { type: ["string", "null"] },
     ssn: { type: ["string", "null"] },
     passport_number: { type: ["string", "null"] },
@@ -864,7 +875,15 @@ REGRAS:
 - Não traduza nomes próprios ou endereços.
 - Endereços devem preservar abreviações (Ste, Apt, Flr) e formatação original.
 - "In Care Of Name" é campo específico de Safe Mailing Address — não confunda com nome da pessoa.
-- Use a visão quando a extração de texto falhar (campos manuscritos, caixas de seleção, assinaturas).`;
+- Use a visão quando a extração de texto falhar (campos manuscritos, caixas de seleção, assinaturas).
+
+A-NUMBER (Alien Registration Number) — REGRA CRÍTICA:
+- O A-Number do APLICANTE aparece repetido em VÁRIAS páginas do formulário (geralmente no cabeçalho/topo de cada página, nos campos de identificação e nas folhas de continuação "Additional Information"). É um número de até 9 dígitos (formato "A-XXXXXXXXX" ou "AXXXXXXXXX").
+- ATENÇÃO AO FORMATO EM CAIXAS: nos formulários USCIS os dígitos do A-Number (e do SSN/USCIS Number) costumam aparecer em CAIXAS SEPARADAS, um dígito por caixa, ex: "A- 1 1 1 1 1 1 1" ou "► A- 3 3 3 3 3 3". CONCATENE os dígitos removendo os espaços → "1111111" / "333333". Use a VISÃO do PDF anexo para ler essas caixas — o texto extraído frequentemente não as captura.
+- SEMPRE reporte o valor que estiver escrito no campo, MESMO que pareça repetido, sequencial ou "de teste" (ex: 1111111, 2222222, 123456789). NÃO retorne null se houver QUALQUER dígito visível no campo de A-Number. null é APENAS para campo genuinamente em branco.
+- Em "a_number" coloque o A-Number do aplicante (o valor que mais se repete ao longo do form). Use null só se o campo estiver realmente vazio em todas as páginas.
+- Em "a_numbers_seen" liste TODAS as ocorrências de A-Number que você encontrar NESTE formulário, UMA ENTRADA POR PÁGINA onde o número aparecer, com {value: "<dígitos concatenados>", page: <número da página: 1 para a 1ª página do form, 2 para a 2ª, etc.>}. Se o número aparece em páginas diferentes COM VALORES DIFERENTES, liste cada um com sua página — isso é exatamente o que precisamos detectar (divergência interna do form).
+- NÃO inclua em "a_number" nem em "a_numbers_seen" o USCIS Number / A-Number do ADVOGADO/REPRESENTANTE. Na PRIMEIRA PÁGINA de cada formulário aparecem os dados do advogado (nome, USCIS Online Account / USCIS Number, Bar License) — esses números pertencem ao representante legal, NÃO ao aplicante. Ignore-os.`;
 
 const FORM_HINTS: Record<string, string> = {
   "I-914": `Dicas pro I-914:

@@ -30,6 +30,18 @@ export const PersonSchema = z.object({
   gender: z.string().nullable().optional(),
   marital_status: z.string().nullable().optional(),
   a_number: z.string().nullable().optional(),
+  // Todas as ocorrências de A-Number vistas neste formulário (uma por página
+  // onde o número aparece). Permite detectar divergência DENTRO do mesmo form
+  // (ex: I-192 pág.2 != pág.9) e ENTRE forms do mesmo sujeito. NÃO inclui o
+  // USCIS Number do advogado (cabeçalho da pág.1). Vide regra applyANumberConsistency.
+  a_numbers_seen: z
+    .array(
+      z.object({
+        value: z.string(),
+        page: z.union([z.string(), z.number()]).nullable().optional()
+      })
+    )
+    .default([]),
   uscis_online_account: z.string().nullable().optional(),
   ssn: z.string().nullable().optional(),
   passport_number: z.string().nullable().optional(),

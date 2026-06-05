@@ -522,7 +522,10 @@ Máximo 8 findings. Não emita findings se não houver evidência clara nos dado
           ]
         };
         if (useThinking) {
-          params.thinking = { type: "enabled", budget_tokens: 10000 } as any;
+          // claude-opus-4-7 só aceita adaptive thinking; "enabled"+budget_tokens dá 400.
+          // A profundidade do raciocínio passa a ser controlada por output_config.effort.
+          params.thinking = { type: "adaptive" } as any;
+          params.output_config = { effort: "high" } as any;
         }
         return client.messages.create(params);
       });
@@ -856,7 +859,10 @@ Use a tool report_adversarial_decisions e devolva exatamente uma decisão por fi
         };
         if (useThinking) {
           // tool_choice: "auto" porque Anthropic não permite thinking + tool_choice forçado.
-          params.thinking = { type: "enabled", budget_tokens: 10000 } as any;
+          // claude-opus-4-7 só aceita adaptive thinking; "enabled"+budget_tokens dá 400.
+          // A profundidade do raciocínio passa a ser controlada por output_config.effort.
+          params.thinking = { type: "adaptive" } as any;
+          params.output_config = { effort: "high" } as any;
           params.tool_choice = { type: "auto" } as any;
         } else {
           // Sem thinking podemos forçar tool_use.
@@ -1129,6 +1135,16 @@ export async function adversarialReview(
 // Aplica decisões adversariais sobre o array original de findings, devolvendo
 // um array filtrado (drop removido, weaken com severidade rebaixada, keep e
 // findings sem decisão mantidos como estão).
+/**
+ * Findings determinísticos que NÃO podem ser dropados/enfraquecidos pelo
+ * adversarial pass. São divergências matemáticas que o cliente exige ver.
+ * T_CONS_ANUMBER_DIVERGE: divergência de A-Number entre páginas/forms (Flavia,
+ * 03/06 — reclamou que essa revisão "sumia"). Mantém a versão crítica imune; a
+ * variante rebaixada (T_CONS_ANUMBER_SSN_EXTRACTOR_SWAP) continua sujeita ao
+ * adversarial, pois é justamente o caso ambíguo (advogado/swap).
+ */
+const ADVERSARIAL_IMMUNE_RULE_IDS = new Set<string>(["T_CONS_ANUMBER_DIVERGE"]);
+
 export function applyAdversarialDecisions(
   originalFindings: Finding[],
   decisions: AdversarialDecision[]
@@ -1151,6 +1167,11 @@ export function applyAdversarialDecisions(
   originalFindings.forEach((f, i) => {
     const decision = byIndex.get(i);
     if (!decision) {
+      out.push(f);
+      return;
+    }
+    // Findings determinísticos imunes: ignora drop/weaken do adversarial.
+    if (f.rule_id && ADVERSARIAL_IMMUNE_RULE_IDS.has(f.rule_id)) {
       out.push(f);
       return;
     }

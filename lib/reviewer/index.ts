@@ -450,7 +450,13 @@ export async function reviewProcess(input: ReviewInput): Promise<ReviewOutput> {
           return { type: "form_u_i918b", data } as const;
         }
       }
-      const usesVision = job.doc.kind === "I-914B";
+      // Visão é necessária pros forms de identidade: os campos A-Number/SSN/
+      // USCIS Number aparecem em CAIXAS de caractere (ex: "1 1 1 1 1 1 1") que o
+      // parser de texto NÃO captura (campo sai vazio). Sem visão, A-Number vira
+      // null e divergências "somem" (bug reportado pela Flavia, 03/06). Esses
+      // forms são pequenos (<1MB), então o custo é baixo. I-914B já usava visão.
+      const VISION_FORMS = new Set(["I-914", "I-914A", "I-192", "I-765", "I-914B"]);
+      const usesVision = VISION_FORMS.has(job.doc.kind);
       const data = await extractFormFromText({
         formKind: job.doc.kind,
         text: job.doc.text,

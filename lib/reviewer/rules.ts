@@ -2,6 +2,7 @@ import type {
   Address,
   CountryConditionsAnalysis,
   Finding,
+  FindingSeverity,
   FormData,
   LeaQualification,
   MedicalAnalysis,
@@ -37,8 +38,13 @@ export const GOVISA_ADDRESS = {
  * números com o A-Number do aplicante, gerando falsos positivos nos checks de
  * consistência. Qualquer A-Number que bata com um desses é silenciado.
  */
+// Valores já normalizados por canonANumber (só dígitos, sem zeros à esquerda).
 const ATTORNEY_USCIS_NUMBERS = new Set<string>([
-  // Jeffrey Weingrad — advogado atual da Go Visa
+  // Advogado da Go Visa — USCIS Online Account Number que aparece no rodapé da
+  // pág.1 dos forms (ex: I-765 "Attorney USCIS Online Account Number 047574393981").
+  // O extractor já confundiu isso com o A-Number do cliente; trava determinística.
+  "47574393981", // 047574393981 normalizado
+  "47574393", // 047574393 — variante truncada que o extractor capturou na rodada 1
   // Adicionar novos advogados aqui conforme necessário
 ]);
 
@@ -712,7 +718,9 @@ function applyLevel2IntraCluster(
       ["Date of Birth", reference.date_of_birth, p.date_of_birth, RULE_IDS.T_CONS_DOB_FORMS_DIVERGE],
       ["Country of Birth", reference.country_of_birth, p.country_of_birth, RULE_IDS.T_CONS_BIRTH_COUNTRY_DIVERGE],
       ["Passport Number", reference.passport_number, p.passport_number, RULE_IDS.T_CONS_PASSPORT_NUMBER_DIVERGE],
-      ["A-Number", reference.a_number, p.a_number, RULE_IDS.T_CONS_ANUMBER_DIVERGE],
+      // A-Number: tratado por applyANumberConsistency (cobre divergência DENTRO
+      // do mesmo form e ENTRE forms, com captura por página). Removido daqui pra
+      // não duplicar e pra usar a captura por-ocorrência.
       [
         "Marital Status",
         normalizeMarital(reference.marital_status),
@@ -729,48 +737,8 @@ function applyLevel2IntraCluster(
         ? namesPlausiblyEqual(a, b)
         : norm(a) === norm(b);
       if (!equivalent) {
-        // Calibração rodada 4 (Flavia 04/05): pra A-Number especificamente,
-        // a Flavia confirmou que no PDF físico os números estão corretos —
-        // a divergência é falha do extractor (geralmente swap A-number/SSN).
-        // Quando detectamos o swap, emitir um rule_id distinto e mais brando
-        // ao invés de cobrar como erro do filing.
-        let severity: "critica" | "alta" = "critica";
-        let useRuleId = rid;
-        let explanation = `${label} divergente entre formulários do mesmo sujeito. USCIS cruza dados e isso dá RFE.`;
-        let recommendation =
-          "Padronizar o valor usando documento oficial (passaporte/certidão) como fonte da verdade.";
-        if (label === "A-Number") {
-          const refSsn = norm(reference.ssn ?? "");
-          const fSsn = norm(p.ssn ?? "");
-          const swapDetected =
-            (refSsn && norm(b ?? "") === refSsn) ||
-            (fSsn && norm(a ?? "") === fSsn);
-          if (swapDetected) {
-            severity = "alta";
-            useRuleId = RULE_IDS.T_CONS_ANUMBER_SSN_EXTRACTOR_SWAP;
-            explanation =
-              "A-Number e SSN aparecem trocados entre formulários do mesmo sujeito — provável falha do extrator de dados, não do filing. Conferir nos PDFs originais.";
-            recommendation =
-              "Verificar diretamente nos PDFs se A-Number e SSN estão na ordem correta. Se OK no impresso, ignorar — é falha do extractor.";
-          } else {
-            // Calibração rodada 5 (11/05): na primeira página de CADA form
-            // USCIS aparecem os dados do advogado (nome, USCIS Number, bar
-            // license). O extractor frequentemente captura o USCIS Number do
-            // advogado como se fosse o A-Number do aplicante, gerando falso
-            // positivo de divergência. Quando a divergência é entre um form
-            // onde o A-Number bate com a maioria e outro form isolado (tipicamente
-            // I-765 ou I-192), rebaixar para "extractor_swap" pois é quase
-            // certo que o número diferente veio do header do advogado.
-            severity = "alta";
-            useRuleId = RULE_IDS.T_CONS_ANUMBER_SSN_EXTRACTOR_SWAP;
-            explanation =
-              "A-Number divergente entre formulários do mesmo sujeito. Frequentemente o extrator captura o USCIS Number do advogado (que aparece na primeira página de cada form) ao invés do A-Number real do aplicante. Conferir nos PDFs originais antes de tratar como erro.";
-            recommendation =
-              "Verificar diretamente nos PDFs se ambos os A-Numbers são do aplicante. Nos formulários USCIS, o topo da página 1 traz os dados do advogado (USCIS Number) — esses dados NÃO são do cliente.";
-          }
-        }
         out.push({
-          severity,
+          severity: "critica",
           tier: "tier1_filing",
           category: "divergencia",
           field: label,
@@ -778,9 +746,10 @@ function applyLevel2IntraCluster(
           expected: `${a} (em ${personForms[0].form})`,
           found: `${b} (em ${f.form})`,
           source: `${personForms[0].form} vs ${f.form} (sujeito ${subject.display_name})`,
-          explanation,
-          recommendation,
-          rule_id: useRuleId,
+          explanation: `${label} divergente entre formulários do mesmo sujeito. USCIS cruza dados e isso dá RFE.`,
+          recommendation:
+            "Padronizar o valor usando documento oficial (passaporte/certidão) como fonte da verdade.",
+          rule_id: rid,
           subject_id: subject.id
         });
       }
@@ -807,6 +776,196 @@ function applyLevel2IntraCluster(
         subject_id: subject.id
       });
     }
+  }
+
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// A-Number — consistência por sujeito (intra-form + entre-forms)
+// ---------------------------------------------------------------------------
+//
+// Requisito do cliente (Flavia, 03/06): o A-Number tem sempre 9 dígitos e
+// aparece repetido em VÁRIAS páginas de cada form. O revisor TEM que pegar
+// divergência (a) entre páginas do MESMO form e (b) entre forms do mesmo
+// sujeito. Antes, o schema guardava só 1 A-Number por form, o que tornava (a)
+// impossível e (b) frágil. Agora cada form traz person.a_numbers_seen com todas
+// as ocorrências por página; esta regra agrega tudo por sujeito e compara.
+//
+// Salvaguardas contra os falsos positivos calibrados nas rodadas 4/5:
+//  - número do advogado (USCIS Number do header da pág.1) é excluído na extração
+//    e também pela allowlist ATTORNEY_USCIS_NUMBERS;
+//  - se um valor minoritário aparece UMA vez e só na pág.1, é tratado como
+//    provável vazamento do número do advogado (rebaixa pra "alta"/extractor_swap);
+//  - se um valor divergente bate com o SSN do sujeito, é swap do extrator (alta).
+// Divergências reais (incl. intra-form) ficam "critica" e são imunes ao
+// adversarial pass (vide applyAdversarialDecisions em senior.ts).
+
+/** Normaliza um A-Number para comparação: só dígitos, sem zeros à esquerda. */
+function canonANumber(raw?: string | null): string | null {
+  if (!raw) return null;
+  const digits = String(raw).replace(/[^0-9]/g, "");
+  if (!digits) return null;
+  return digits.replace(/^0+/, "") || "0";
+}
+
+interface ANumberOcc {
+  canon: string;
+  raw: string;
+  form: string;
+  page: string | number | null;
+}
+
+function applyANumberConsistency(
+  subjects: Subject[],
+  clusters: Map<string, FormData[]>
+): Finding[] {
+  const out: Finding[] = [];
+
+  for (const subject of subjects) {
+    const forms = clusters.get(subject.id) ?? [];
+    if (forms.length === 0) continue;
+
+    const occ: ANumberOcc[] = [];
+    const ssnSet = new Set<string>();
+
+    for (const f of forms) {
+      // I-914 / I-192 / I-765 usam `person`; I-914A (dependente) usa `family_member`.
+      const person = (f as any).person ?? (f as any).family_member;
+      if (!person || typeof person !== "object") continue;
+
+      if (person.ssn) {
+        const s = String(person.ssn).replace(/[^0-9]/g, "");
+        if (s) ssnSet.add(s);
+      }
+
+      const seen: Array<{ value?: string; page?: string | number | null }> =
+        Array.isArray(person.a_numbers_seen) ? person.a_numbers_seen : [];
+
+      if (seen.length > 0) {
+        for (const s of seen) {
+          const canon = canonANumber(s?.value);
+          if (!canon) continue;
+          occ.push({ canon, raw: String(s.value), form: f.form, page: s.page ?? null });
+        }
+      } else if (person.a_number) {
+        // Fallback (debug antigo sem a_numbers_seen): usa o valor único do form.
+        const canon = canonANumber(person.a_number);
+        if (canon) occ.push({ canon, raw: String(person.a_number), form: f.form, page: null });
+      }
+    }
+
+    if (occ.length === 0) continue;
+
+    // Exclui números do advogado (allowlist por canon normalizado).
+    const filtered = occ.filter((o) => !ATTORNEY_USCIS_NUMBERS.has(o.canon));
+    if (filtered.length === 0) continue;
+
+    // Agrupa por valor canônico.
+    const byCanon = new Map<string, ANumberOcc[]>();
+    for (const o of filtered) {
+      if (!byCanon.has(o.canon)) byCanon.set(o.canon, []);
+      byCanon.get(o.canon)!.push(o);
+    }
+    if (byCanon.size < 2) continue; // sem divergência
+
+    const canons = Array.from(byCanon.keys());
+
+    // Divergência DENTRO de um mesmo form (ex: I-192 pág.2 != pág.9) — inequívoca.
+    const formToCanons = new Map<string, Set<string>>();
+    for (const o of filtered) {
+      if (!formToCanons.has(o.form)) formToCanons.set(o.form, new Set());
+      formToCanons.get(o.form)!.add(o.canon);
+    }
+    const intraFormDivergence = Array.from(formToCanons.values()).some((s) => s.size >= 2);
+
+    // Heurística do advogado: valor que aparece 1x e só na pág.1 (header do
+    // representante). Só aplica quando NÃO há divergência intra-form.
+    const attorneyLeakCanon = (() => {
+      if (intraFormDivergence) return null;
+      for (const [canon, list] of byCanon) {
+        if (list.length !== 1) continue;
+        const pg = list[0].page;
+        const pageNum = typeof pg === "number" ? pg : parseInt(String(pg ?? ""), 10);
+        if (pageNum === 1) return canon;
+      }
+      return null;
+    })();
+
+    // Swap A-Number/SSN do extrator: algum valor divergente bate com o SSN.
+    const swapCanon = canons.find((c) => ssnSet.has(c)) ?? null;
+
+    // Descrição das fontes: "12345 (I-914 p.2)  ≠  67890 (I-192 p.2, I-192 p.9)".
+    const sourcesDesc = canons
+      .map((c) => {
+        const list = byCanon.get(c)!;
+        const where = list
+          .map((o) => `${o.form}${o.page != null ? ` p.${o.page}` : ""}`)
+          .join(", ");
+        return `${list[0].raw} (${where})`;
+      })
+      .join("  ≠  ");
+
+    const formsInvolved = Array.from(new Set(filtered.map((o) => o.form))).join(", ");
+
+    // Nota de formato: A-Number válido tem 9 dígitos.
+    const badFormat = canons.filter((c) => c.replace(/^0+/, "").length !== 9 && c.length !== 9);
+    const formatNote =
+      badFormat.length > 0
+        ? " Obs.: A-Number válido tem 9 dígitos — verificar também o formato dos números acima."
+        : "";
+
+    let severity: FindingSeverity = "critica";
+    let useRuleId: string = RULE_IDS.T_CONS_ANUMBER_DIVERGE;
+    let explanation: string;
+    let recommendation: string;
+
+    if (intraFormDivergence) {
+      explanation =
+        `A-Number divergente DENTRO de um mesmo formulário (números diferentes em páginas distintas) para ${subject.display_name}. ` +
+        `O A-Number deve ser idêntico em todas as páginas do form. USCIS cruza esses dados e isso gera RFE/NOID.` +
+        formatNote;
+      recommendation =
+        "Corrigir o formulário para que o A-Number seja o mesmo em todas as páginas, conforme o documento de identificação oficial em anexo.";
+    } else if (swapCanon) {
+      severity = "alta";
+      useRuleId = RULE_IDS.T_CONS_ANUMBER_SSN_EXTRACTOR_SWAP;
+      explanation =
+        "A-Number e SSN aparecem trocados entre formulários do mesmo sujeito — provável falha do extrator de dados. Conferir nos PDFs originais." +
+        formatNote;
+      recommendation =
+        "Verificar diretamente nos PDFs se A-Number e SSN estão na ordem correta. Se OK no impresso, ignorar — é falha do extractor.";
+    } else if (attorneyLeakCanon) {
+      severity = "alta";
+      useRuleId = RULE_IDS.T_CONS_ANUMBER_SSN_EXTRACTOR_SWAP;
+      explanation =
+        "A-Number divergente entre formulários, mas um dos valores aparece só na primeira página (onde fica o USCIS Number do advogado). Provável captura do número do representante, não do aplicante. Conferir nos PDFs originais antes de tratar como erro." +
+        formatNote;
+      recommendation =
+        "Verificar se o número divergente é do aplicante e não do advogado (topo da pág.1 traz dados do representante).";
+    } else {
+      explanation =
+        `A-Number divergente entre formulários do mesmo sujeito (${subject.display_name}). ` +
+        `O A-Number deve ser idêntico em todos os forms. USCIS cruza esses dados e a divergência gera RFE/NOID.` +
+        formatNote;
+      recommendation =
+        "Padronizar o A-Number em todos os formulários usando o documento de identificação oficial (carta de imigração / I-797) como fonte da verdade.";
+    }
+
+    out.push({
+      severity,
+      tier: "tier1_filing",
+      category: "divergencia",
+      field: "A-Number divergente",
+      form: formsInvolved || null,
+      expected: "Mesmo A-Number (9 dígitos) em todas as páginas e formulários",
+      found: sourcesDesc,
+      source: `sujeito ${subject.display_name}`,
+      explanation,
+      recommendation,
+      rule_id: useRuleId,
+      subject_id: subject.id
+    });
   }
 
   return out;
@@ -2797,6 +2956,9 @@ export function applyGovisaRules(args: RulesInput | RulesInputV2): Finding[] {
     if (cluster.length === 0) continue;
     out.push(...applyLevel2IntraCluster(subject, cluster));
   }
+
+  // A-Number — consistência por sujeito (intra-form + entre-forms)
+  out.push(...applyANumberConsistency(subjects, clusters));
 
   // Nível 3 — Cross-cluster (principal × cada dep)
   const principal = subjects.find((s) => s.role === "principal");
