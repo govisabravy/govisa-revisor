@@ -294,6 +294,10 @@ F. **Comprovante de residência**: um único comprovante de residência cobre to
 
 G. **Relationship × idade — NÃO reclassifique a relação (caso Anderson Ricardo, Flavia 05/06)**: confie no campo "relationship_to_principal" como está extraído de cada I-914A. NÃO conclua que a relação está errada com base na idade/DOB. Quando há MAIS DE UM dependente (ex: um cônjuge e um filho) e a relação parece incompatível com a idade (ex: alguém marcado "child" que é mais velho que o principal), isso quase sempre significa que os dependentes foram TROCADOS na associação dos formulários (o I-914A de um dep foi associado ao outro) — NÃO que o filing esteja errado. Nesse caso NÃO emita finding crítico afirmando que a relação está classificada errada. No máximo, um aviso leve (severidade baixa) para "conferir qual I-914A pertence a qual dependente". O PDF normalmente está correto; o erro, quando existe, é de associação interna, não do filing.
 
+H. **Endereço atual — fonte definitiva é o I-192 (item 2, 10/06)**: quando o caso tem I-192, o endereço declarado no ITEM 10 da PART 2 (pág. 3) do I-192 é a FONTE DEFINITIVA do endereço físico atual do requerente. Se outros forms ou comprovantes divergirem, a recomendação é alinhar TUDO ao endereço do I-192 — NÃO emita findings tratando o endereço de outro form/comprovante como o correto contra o I-192.
+
+I. **Familiares cidadãos americanos (item 5, 10/06)**: cônjuge ou familiar que é CIDADÃO AMERICANO (verificável pela certidão de casamento americana, certidão de nascimento US, ou is_us_citizen=true) NÃO precisa de NENHUM formulário derivativo: nem I-914A/I-918A, nem I-192, nem I-194, nem I-765 derivativo. NÃO emita findings apontando ausência de I-194 (ou de qualquer form derivativo) para pessoa que é US citizen. Cidadão americano não é "derivative" — ele simplesmente não entra no filing.
+
 Use o raciocínio passo a passo (extended thinking) antes de produzir o JSON final.`;
 
 function redactForSummary(form: any): any {
@@ -325,8 +329,10 @@ function buildCaseSummary(input: SeniorInput): string {
     const rel = s.relationship_to_principal
       ? `, rel: ${s.relationship_to_principal}`
       : "";
+    const anum = (s as any).a_number ? `, A#: ${(s as any).a_number}` : "";
+    const usc = (s as any).is_us_citizen === true ? ", US citizen" : "";
     lines.push(
-      `- [${s.id}] ${s.role} — ${s.display_name} (DOB: ${s.date_of_birth ?? "?"}, citizenship: ${s.country_of_citizenship ?? "?"}${rel})`
+      `- [${s.id}] ${s.role} — ${s.display_name} (DOB: ${s.date_of_birth ?? "?"}, citizenship: ${s.country_of_citizenship ?? "?"}${rel}${anum}${usc})`
     );
   }
   lines.push("");

@@ -1,4 +1,5 @@
 import { extractPdf } from "./extract";
+import { throwIfAborted } from "./cancel-registry";
 import { onUsage, type UsageEvent } from "./claude";
 import {
   splitPdfByRanges,
@@ -21,7 +22,7 @@ import {
   type PassportSignatureCheck,
   type StructureDocument
 } from "./claude";
-import { applyGovisaRules, summarize } from "./rules";
+import { applyGovisaRules, summarize, assignSubjectANumbers } from "./rules";
 import { RULE_IDS } from "./rule_ids";
 import { extractI360FromText, extractVawaStoryFromText, applyVawaRules } from "./vawa";
 import {
@@ -65,6 +66,8 @@ export interface ReviewInput {
   buffer: Buffer;
   mode?: "draft" | "final";
   caseType?: CaseType;
+  /** Cancelamento (fix 10/06): abortar interrompe o pipeline na próxima fronteira. */
+  signal?: AbortSignal;
 }
 
 export interface PassportCheckEntry {
@@ -337,6 +340,85 @@ function checkTableOfContents(pages: string[], docs: StructureDocument[]): Findi
 }
 
 // ---------------------------------------------------------------------------
+// Item 5 (10/06): I-194 dispensado pra familiares cidadãos americanos
+// ---------------------------------------------------------------------------
+
+const US_CITIZENSHIP_RE =
+  /^(u\.?\s?s\.?a?\.?|us|usa|united\s+states(\s+of\s+america)?|american|estados\s+unidos)$/i;
+
+function normNameTokens(name?: string | null): string[] {
+  return String(name ?? "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .split(/[^a-z]+/)
+    .filter(Boolean)
+    .sort();
+}
+
+function sameNameLoose(a?: string | null, b?: string | null): boolean {
+  const ta = normNameTokens(a);
+  const tb = normNameTokens(b);
+  if (ta.length === 0 || tb.length === 0) return false;
+  const setB = new Set(tb);
+  const setA = new Set(ta);
+  const aInB = ta.every((t) => setB.has(t));
+  const bInA = tb.every((t) => setA.has(t));
+  return aInB || bInA;
+}
+
+function subjectIsUSCitizen(s: Subject, i914: any): boolean {
+  if ((s as any).is_us_citizen === true) return true;
+  const cit = (s.country_of_citizenship ?? "").trim();
+  if (cit && US_CITIZENSHIP_RE.test(cit)) return true;
+  // Cruza com family_members_included do I-914 (campo is_us_citizen)
+  const fms: any[] = Array.isArray(i914?.family_members_included)
+    ? i914.family_members_included
+    : [];
+  for (const fm of fms) {
+    if (fm?.is_us_citizen === true && sameNameLoose(fm?.name, s.display_name)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const SPOUSE_REL_RE = /spouse|c[ôo]njuge|esposa|esposo|marido|wife|husband/i;
+const I194_RE = /\bI-?\s?194\b/i;
+
+function dropI194FindingsForUSCitizens(
+  findings: Finding[],
+  subjects: Subject[],
+  i914: any
+): Finding[] {
+  const uscIds = new Set(
+    subjects.filter((s) => subjectIsUSCitizen(s, i914)).map((s) => s.id)
+  );
+  const spouseIsUsc =
+    subjects.some(
+      (s) => SPOUSE_REL_RE.test(s.relationship_to_principal ?? "") && uscIds.has(s.id)
+    ) ||
+    (Array.isArray(i914?.family_members_included) &&
+      i914.family_members_included.some(
+        (fm: any) =>
+          fm?.is_us_citizen === true && SPOUSE_REL_RE.test(String(fm?.relationship ?? ""))
+      ));
+  if (uscIds.size === 0 && !spouseIsUsc) return findings;
+
+  return findings.filter((f) => {
+    const text = [f.field, f.form, f.expected, f.found, f.explanation, f.recommendation]
+      .filter(Boolean)
+      .join(" | ");
+    if (!I194_RE.test(text)) return true;
+    // Finding sobre I-194 atribuído a um sujeito US citizen → dispensado.
+    if (f.subject_id && uscIds.has(f.subject_id)) return false;
+    // Finding sobre I-194 mencionando cônjuge quando o cônjuge é US citizen.
+    if (spouseIsUsc && SPOUSE_REL_RE.test(text)) return false;
+    return true;
+  });
+}
+
+// ---------------------------------------------------------------------------
 // reviewProcess
 // ---------------------------------------------------------------------------
 
@@ -349,8 +431,10 @@ export async function reviewProcess(input: ReviewInput): Promise<ReviewOutput> {
     usageEvents.push(e);
   });
 
+  throwIfAborted(input.signal);
   const pdf = await extractPdf(input.buffer);
 
+  throwIfAborted(input.signal);
   const structure = await mapDocumentStructure(pdf.pages);
   const docs: StructureDocument[] = structure?.documents ?? [];
 
@@ -478,6 +562,9 @@ export async function reviewProcess(input: ReviewInput): Promise<ReviewOutput> {
 
   const concurrency = Number(process.env.REVIEWER_CONCURRENCY ?? "4");
   const results = await runWithConcurrency(jobs, concurrency, async (job) => {
+    // Cancelamento: cada job checa antes de chamar o LLM. Jobs em voo terminam,
+    // mas nenhum novo trabalho é iniciado após o abort.
+    throwIfAborted(input.signal);
     if (job.type === "form") {
       const k = job.doc.kind;
       const sid = job.doc.subject_id ?? null;
@@ -646,6 +733,7 @@ export async function reviewProcess(input: ReviewInput): Promise<ReviewOutput> {
   // ---------------------------------------------------------------------------
   // Proof of address (rodada APÓS extrações pra ter expected_holder_names)
   // ---------------------------------------------------------------------------
+  throwIfAborted(input.signal);
   let proofOfAddress: ProofOfAddressAnalysis | null = null;
   {
     const expectedHolders = subjects.map((s) => ({
@@ -674,6 +762,7 @@ export async function reviewProcess(input: ReviewInput): Promise<ReviewOutput> {
   // ---------------------------------------------------------------------------
   // FASE 3.5 — Cluster Validator (corrige subject_id antes das regras)
   // ---------------------------------------------------------------------------
+  throwIfAborted(input.signal);
   let clusterCorrectionsApplied = 0;
   let clusterNewSubjectsApplied = 0;
   try {
@@ -727,7 +816,8 @@ export async function reviewProcess(input: ReviewInput): Promise<ReviewOutput> {
         given_name: ns.given_name,
         date_of_birth: ns.date_of_birth,
         country_of_citizenship: ns.country_of_citizenship,
-        relationship_to_principal: ns.relationship_to_principal
+        relationship_to_principal: ns.relationship_to_principal,
+        is_us_citizen: ns.is_us_citizen ?? null
       });
       clusterNewSubjectsApplied++;
     }
@@ -739,8 +829,28 @@ export async function reviewProcess(input: ReviewInput): Promise<ReviewOutput> {
   }
 
   // ---------------------------------------------------------------------------
+  // A-Number por sujeito (item 4, 10/06): cada pessoa do processo carrega o
+  // próprio A-Number no relatório, separando principal × dependentes.
+  // ---------------------------------------------------------------------------
+  try {
+    const allFormsForANumbers: FormData[] =
+      caseType === "t_visa"
+        ? formsT
+        : caseType === "u_visa"
+        ? ([i918, ...i918as, i918b, ...formsT].filter(Boolean) as FormData[])
+        : ([i360, ...formsT].filter(Boolean) as FormData[]);
+    assignSubjectANumbers(subjects, allFormsForANumbers);
+  } catch (err) {
+    console.error(
+      "assignSubjectANumbers falhou (degradando):",
+      String((err as any)?.message ?? err).slice(0, 150)
+    );
+  }
+
+  // ---------------------------------------------------------------------------
   // Regras determinísticas (4 níveis)
   // ---------------------------------------------------------------------------
+  throwIfAborted(input.signal);
   let findings: Finding[] = [];
   let extractedForms: any[] = [];
   let storyFacts: any = null;
@@ -871,6 +981,7 @@ export async function reviewProcess(input: ReviewInput): Promise<ReviewOutput> {
   // ---------------------------------------------------------------------------
   // Senior Cross-Check (Claude pass narrativo)
   // ---------------------------------------------------------------------------
+  throwIfAborted(input.signal);
   let seniorFindings: Finding[] = [];
   try {
     const formsBySubject = groupFormsBySubject(formsT);
@@ -948,6 +1059,7 @@ export async function reviewProcess(input: ReviewInput): Promise<ReviewOutput> {
   // ---------------------------------------------------------------------------
   // FASE 5.5 — Adversarial Pass (contesta cada finding, filtra alucinações)
   // ---------------------------------------------------------------------------
+  throwIfAborted(input.signal);
   let adversarialDropped = 0;
   let adversarialWeakened = 0;
   try {
@@ -1013,6 +1125,7 @@ export async function reviewProcess(input: ReviewInput): Promise<ReviewOutput> {
   // ---------------------------------------------------------------------------
   // FASE 6 — RFE Prediction (camada determinística + refine LLM opcional)
   // ---------------------------------------------------------------------------
+  throwIfAborted(input.signal);
   let rfePredictions: RFEPrediction[] = [];
   try {
     const i914Form = formsT.find((f) => f.form === "I-914") as any;
@@ -1044,6 +1157,23 @@ export async function reviewProcess(input: ReviewInput): Promise<ReviewOutput> {
       String((err as any)?.message ?? err).slice(0, 200)
     );
     rfePredictions = [];
+  }
+
+  // ---------------------------------------------------------------------------
+  // Item 5 (10/06): familiares CIDADÃOS AMERICANOS não precisam de forms
+  // derivativos (I-194, I-192, I-914A, I-765 derivativo). Se o cônjuge (ou
+  // outro familiar) é US citizen — verificável pela certidão de casamento
+  // americana / I-914 family_members_included / cluster validator — findings
+  // exigindo I-194 (ou docs derivativos) pra essa pessoa são removidos.
+  // ---------------------------------------------------------------------------
+  try {
+    const i914ForUsc = formsT.find((f) => f.form === "I-914") as any;
+    findings = dropI194FindingsForUSCitizens(findings, subjects, i914ForUsc ?? null);
+  } catch (err) {
+    console.error(
+      "dropI194FindingsForUSCitizens falhou (degradando):",
+      String((err as any)?.message ?? err).slice(0, 150)
+    );
   }
 
   // ---------------------------------------------------------------------------

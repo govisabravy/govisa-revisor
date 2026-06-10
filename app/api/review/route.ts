@@ -6,6 +6,12 @@ import { estimateCostUSD } from "@/lib/pricing";
 import { logEvent } from "@/lib/logger";
 import { getCurrentUser } from "@/lib/auth/current-user";
 import {
+  registerCancellable,
+  unregisterCancellable,
+  isReviewCancelled,
+  ReviewCancelledError
+} from "@/lib/reviewer/cancel-registry";
+import {
   isStorageEnabled,
   uploadReviewPdf,
   buildReviewPdfKey
@@ -23,6 +29,10 @@ export async function POST(req: NextRequest) {
 
   logEvent({ level: "info", msg: "review.start", review_id: reviewId, user_id: user.id });
 
+  // Cancelamento (fix 10/06 — caso Anderson): o front envia um cancel_token e
+  // pode abortar a review via POST /api/review/cancel. Também encadeamos o
+  // abort do próprio fetch (req.signal) como redundância.
+  let cancelToken: string | null = null;
   try {
     const formData = await req.formData();
     const file = formData.get("file");
@@ -39,7 +49,20 @@ export async function POST(req: NextRequest) {
     const caseType: "t_visa" | "vawa" | "u_visa" =
       caseTypeRaw === "vawa" ? "vawa" : caseTypeRaw === "u_visa" ? "u_visa" : "t_visa";
 
-    const result = await reviewProcess({ buffer, mode, caseType });
+    const tokenRaw = formData.get("cancel_token");
+    cancelToken = typeof tokenRaw === "string" && tokenRaw ? tokenRaw : reviewId;
+    const cancelCtrl = registerCancellable(cancelToken);
+    // Redundância: se o fetch do browser for abortado/desconectado, cancela também.
+    try {
+      req.signal?.addEventListener?.("abort", () => cancelCtrl.abort());
+      if (req.signal?.aborted) cancelCtrl.abort();
+    } catch {
+      // ambiente sem req.signal — segue só com o token explícito
+    }
+
+    const result = await reviewProcess({ buffer, mode, caseType, signal: cancelCtrl.signal });
+    // Cancelamento que chegou no finalzinho do pipeline: não salvar mesmo assim.
+    if (cancelCtrl.signal.aborted) throw new ReviewCancelledError();
 
     let pdfObjectKey: string | null = null;
     if (isStorageEnabled()) {
@@ -141,6 +164,14 @@ export async function POST(req: NextRequest) {
       }
     });
   } catch (err: any) {
+    if (isReviewCancelled(err)) {
+      logEvent({ level: "info", msg: "review.cancelled", review_id: reviewId, user_id: user.id });
+      // Nada é salvo: a review cancelada não entra no histórico nem em KPIs.
+      return NextResponse.json(
+        { review_id: reviewId, cancelled: true, error: "Revisão cancelada pelo usuário." },
+        { status: 499 }
+      );
+    }
     logEvent({
       level: "error",
       msg: "review.failed",
@@ -151,5 +182,7 @@ export async function POST(req: NextRequest) {
       { review_id: reviewId, error: err?.message ?? "Erro ao processar PDF" },
       { status: 500 }
     );
+  } finally {
+    if (cancelToken) unregisterCancellable(cancelToken);
   }
 }

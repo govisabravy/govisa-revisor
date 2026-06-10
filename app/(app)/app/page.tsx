@@ -30,6 +30,7 @@ export default function NewReview() {
   const [caseType, setCaseType] = useState<"t_visa"|"vawa"|"u_visa">("t_visa");
   const [recent, setRecent] = useState<Recent[]>([]);
   const [abortCtrl, setAbortCtrl] = useState<AbortController | null>(null);
+  const [cancelToken, setCancelToken] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
 
   // Cronômetro durante revisão
@@ -63,11 +64,17 @@ export default function NewReview() {
     setFileName(file.name);
     const ctrl = new AbortController();
     setAbortCtrl(ctrl);
+    // Token de cancelamento server-side (fix 10/06): abortar só o fetch não
+    // interrompia o processamento no servidor — a review "cancelada" rodava
+    // até o fim e era salva. O token permite POST /api/review/cancel.
+    const token = crypto.randomUUID();
+    setCancelToken(token);
     try {
       const fd = new FormData();
       fd.append("file", file);
       fd.append("mode", mode);
       fd.append("case_type", caseType);
+      fd.append("cancel_token", token);
       const res = await fetch("/api/review", {
         method: "POST",
         body: fd,
@@ -126,10 +133,20 @@ export default function NewReview() {
     } finally {
       setLoading(false);
       setAbortCtrl(null);
+      setCancelToken(null);
     }
   }
 
   function cancelReview() {
+    // 1. Cancela no servidor (interrompe o pipeline de verdade)
+    if (cancelToken) {
+      fetch("/api/review/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: cancelToken })
+      }).catch(() => {});
+    }
+    // 2. Aborta o fetch local (atualiza a UI imediatamente)
     if (abortCtrl) abortCtrl.abort();
   }
 

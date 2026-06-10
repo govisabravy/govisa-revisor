@@ -390,7 +390,15 @@ function clusterFormsBySubject(
 function applyLevel1PerForm(
   f: FormData,
   subject: Subject | null,
-  ctx: { isDraft: boolean; proofOfAddress?: ProofOfAddressAnalysis | null }
+  ctx: {
+    isDraft: boolean;
+    proofOfAddress?: ProofOfAddressAnalysis | null;
+    /**
+     * Item 2 (10/06): endereço do I-192 (Part 2, item 10, pág. 3) do MESMO
+     * sujeito — fonte DEFINITIVA do endereço físico atual do requerente.
+     */
+    i192Address?: Address | null;
+  }
 ): Finding[] {
   const out: Finding[] = [];
   const formName = f.form;
@@ -445,7 +453,40 @@ function applyLevel1PerForm(
     const isEmpty =
       !addr || (!addr.street && !addr.city && !addr.state && !addr.zip);
 
-    if (!isEmpty && !sameAddress(addr)) {
+    // Item 2 (10/06): quando o caso tem I-192, o item 10 da Part 2 (pág. 3)
+    // é a fonte DEFINITIVA do endereço físico atual do requerente. Os demais
+    // forms são validados contra ele:
+    //  - bate com o I-192 → silêncio (não compara mais com comprovante);
+    //  - diverge do I-192 → finding ALTA com o endereço do I-192 como expected.
+    const i192Addr = ctx.i192Address ?? null;
+    const i192HasAddr =
+      !!i192Addr && !!(i192Addr.street || i192Addr.city || i192Addr.zip);
+    let addrGovernedByI192 = false;
+    if (!isEmpty && !sameAddress(addr) && i192HasAddr && formName !== "I-192") {
+      addrGovernedByI192 = true;
+      if (addressLooselyEqual(addr, i192Addr)) {
+        // OK silencioso: endereço validado pela fonte definitiva (I-192).
+      } else {
+        out.push({
+          severity: "alta",
+          tier: "tier1_filing",
+          category: "divergencia",
+          field: "Physical Address (divergente do I-192)",
+          form: formName,
+          expected: addrToStr(i192Addr),
+          found: addrToStr(addr),
+          source: "I-192 Part 2, item 10 (pág. 3)",
+          explanation:
+            "O endereço físico informado neste formulário diverge do endereço atual do requerente declarado no item 10 da Part 2 (pág. 3) do I-192 — a fonte definitiva do endereço atual no processo.",
+          recommendation:
+            "Padronizar o Physical Address de todos os formulários conforme o item 10 da Part 2 do I-192. Se o I-192 estiver desatualizado, corrigir o I-192 primeiro.",
+          rule_id: RULE_IDS.T_FILING_PHYSICAL_ADDR_DIVERGE_I192,
+          subject_id: sid
+        });
+      }
+    }
+
+    if (!isEmpty && !sameAddress(addr) && !addrGovernedByI192) {
       const proof = ctx.proofOfAddress;
       // Comprovante encontrado para QUALQUER sujeito da familia vale para todos:
       // dependentes moram no mesmo endereco que o principal.
@@ -470,6 +511,10 @@ function applyLevel1PerForm(
           // não e necessariamente erro (dep pode morar junto mas o form
           // preenche endereco levemente diferente). Silenciar.
         } else {
+          // Item 2 (10/06): se este form é o próprio I-192, ele é a fonte
+          // definitiva do endereço atual — a divergência com o comprovante
+          // vira alerta pra atualizar/conferir o COMPROVANTE, não o form.
+          const isI192Definitive = formName === "I-192" && i192HasAddr;
           out.push({
             severity: "alta",
             tier: "tier1_filing",
@@ -479,10 +524,12 @@ function applyLevel1PerForm(
             expected: addrToStr(proofAddr ?? null),
             found: addrToStr(addr),
             source: formName,
-            explanation:
-              "Physical Address informado no formulário não bate com o endereço do comprovante de residência anexo.",
-            recommendation:
-              "Conferir o comprovante de residência: ajustar o Physical Address pra refletir o endereço do comprovante OU substituir o comprovante por um que valide o endereço informado.",
+            explanation: isI192Definitive
+              ? "O endereço do comprovante de residência anexo não bate com o endereço atual declarado no item 10 da Part 2 (pág. 3) do I-192 — que é a fonte definitiva do endereço atual do requerente."
+              : "Physical Address informado no formulário não bate com o endereço do comprovante de residência anexo.",
+            recommendation: isI192Definitive
+              ? "Conferir se o comprovante de residência está desatualizado ou pertence a outro endereço; substituir por um comprovante que valide o endereço do item 10 da Part 2 do I-192."
+              : "Conferir o comprovante de residência: ajustar o Physical Address pra refletir o endereço do comprovante OU substituir o comprovante por um que valide o endereço informado.",
             rule_id: RULE_IDS.T_FILING_PHYSICAL_ADDR_MISMATCH_PROOF,
             subject_id: sid
           });
@@ -828,11 +875,55 @@ interface ANumberOcc {
   page: string | number | null;
 }
 
+/**
+ * Coleta os A-Numbers canônicos do PRINCIPAL: ocorrências do cluster do
+ * principal + principal_applicant.a_number dos I-914A/I-918A (Part 1 do
+ * Supplement A é sobre o principal). Usado pra filtrar vazamento do A# do
+ * principal nos clusters dos dependentes (item 4, 10/06 — caso Anderson:
+ * a página "Additional Information" do I-914A traz o A# do PRINCIPAL no
+ * cabeçalho e o extrator atribuía ao family member, gerando falso
+ * "A-Number divergente" crítico nos dependentes).
+ */
+function collectPrincipalANumbers(
+  subjects: Subject[],
+  clusters: Map<string, FormData[]>
+): Set<string> {
+  const set = new Set<string>();
+  const principal = subjects.find((s) => s.role === "principal");
+  const principalForms = principal ? clusters.get(principal.id) ?? [] : [];
+  for (const f of principalForms) {
+    const person = (f as any).person;
+    if (person && typeof person === "object") {
+      const seen: Array<{ value?: string }> = Array.isArray(person.a_numbers_seen)
+        ? person.a_numbers_seen
+        : [];
+      for (const s of seen) {
+        const c = canonANumber(s?.value);
+        if (c) set.add(c);
+      }
+      const c = canonANumber(person.a_number);
+      if (c) set.add(c);
+    }
+  }
+  // Part 1 dos Supplements (I-914A/I-918A) é sobre o principal.
+  for (const forms of Array.from(clusters.values())) {
+    for (const f of forms) {
+      const pa = (f as any).principal_applicant;
+      if (pa && typeof pa === "object") {
+        const c = canonANumber(pa.a_number);
+        if (c) set.add(c);
+      }
+    }
+  }
+  return set;
+}
+
 function applyANumberConsistency(
   subjects: Subject[],
   clusters: Map<string, FormData[]>
 ): Finding[] {
   const out: Finding[] = [];
+  const principalCanons = collectPrincipalANumbers(subjects, clusters);
 
   for (const subject of subjects) {
     const forms = clusters.get(subject.id) ?? [];
@@ -870,8 +961,22 @@ function applyANumberConsistency(
     if (occ.length === 0) continue;
 
     // Exclui números do advogado (allowlist por canon normalizado).
-    const filtered = occ.filter((o) => !ATTORNEY_USCIS_NUMBERS.has(o.canon));
+    let filtered = occ.filter((o) => !ATTORNEY_USCIS_NUMBERS.has(o.canon));
     if (filtered.length === 0) continue;
+
+    // Item 4 (10/06): em clusters de DEPENDENTE, ocorrências que batem com o
+    // A-Number do PRINCIPAL são vazamento do cabeçalho/Part 1 do Supplement A
+    // (Additional Information repete o A# do principal) — pertencem ao
+    // principal, não ao dependente. Removê-las antes de avaliar divergência.
+    if (subject.role === "dependent" && principalCanons.size > 0) {
+      const own = filtered.filter((o) => !principalCanons.has(o.canon));
+      // Só filtra se sobrar pelo menos uma ocorrência própria do dependente —
+      // se TODAS baterem com o principal, mantém (pode ser erro real de
+      // preenchimento usando o A# do principal pro dependente).
+      if (own.length > 0 && own.length < filtered.length) {
+        filtered = own;
+      }
+    }
 
     // Agrupa por valor canônico.
     const byCanon = new Map<string, ANumberOcc[]>();
@@ -981,6 +1086,46 @@ function applyANumberConsistency(
   }
 
   return out;
+}
+
+/**
+ * Item 4 (10/06): atribui a cada sujeito o SEU A-Number (majoritário no
+ * próprio cluster). Ocorrências que batem com o A# do principal são
+ * descartadas nos dependentes (vazamento do cabeçalho do Supplement A).
+ * Resultado vai em subject.a_number e aparece no relatório, separando o
+ * A-Number de cada pessoa do processo.
+ */
+export function assignSubjectANumbers(subjects: Subject[], forms: FormData[]): void {
+  const clusters = clusterFormsBySubject(forms, subjects);
+  const principalCanons = collectPrincipalANumbers(subjects, clusters);
+
+  for (const subject of subjects) {
+    if (subject.a_number) continue;
+    const cluster = clusters.get(subject.id) ?? [];
+    const counts = new Map<string, { count: number; raw: string }>();
+    for (const f of cluster) {
+      const person = (f as any).person ?? (f as any).family_member;
+      if (!person || typeof person !== "object") continue;
+      const seen: Array<{ value?: string }> = Array.isArray(person.a_numbers_seen)
+        ? person.a_numbers_seen
+        : [];
+      const values = seen.map((s) => s?.value).filter(Boolean) as string[];
+      if (values.length === 0 && person.a_number) values.push(String(person.a_number));
+      for (const v of values) {
+        const c = canonANumber(v);
+        if (!c || ATTORNEY_USCIS_NUMBERS.has(c)) continue;
+        if (subject.role === "dependent" && principalCanons.has(c)) continue;
+        const cur = counts.get(c);
+        if (cur) cur.count++;
+        else counts.set(c, { count: 1, raw: String(v) });
+      }
+    }
+    let best: { count: number; raw: string } | null = null;
+    for (const entry of Array.from(counts.values())) {
+      if (!best || entry.count > best.count) best = entry;
+    }
+    if (best) subject.a_number = best.raw;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1952,7 +2097,11 @@ function applyLevel4Global(args: {
         const principalDob = i914?.person?.date_of_birth ?? "";
         const principalYear = principalDob.match(/\d{4}/)?.[0];
         if (year && principalYear) {
-          const ageDiff = Number(principalYear) - Number(year);
+          // Fix 10/06 (caso Anderson): a conta estava invertida
+          // (principalYear - depYear), o que dava -18 pra um filho legítimo
+          // nascido 18 anos depois do principal e disparava falso positivo.
+          // ageDiff = quantos anos o dependente é mais NOVO que o principal.
+          const ageDiff = Number(year) - Number(principalYear);
           // Ajuste (Flavia 29/04): mães jovens são comuns; threshold mais
           // conservador (< 7 anos) e severidade rebaixada para baixa pra
           // funcionar como observação, não bloqueio.
@@ -2765,6 +2914,16 @@ function applyLevel4Global(args: {
       const s = d.toLowerCase();
       if (/passport|passaporte/.test(s)) return false;
       if (/\bnational\s+id\b|\bcédula\b|\bcedula\b|\brg\b/.test(s)) return false;
+      // Item 6 (10/06): certidões/documentos EMITIDOS NOS EUA já saem em
+      // inglês — não precisam de certified translation (8 CFR 103.2(b)(3)
+      // só alcança documentos em língua estrangeira). Ex: Florida Marriage
+      // Record, US birth certificate, county clerk records.
+      const looksUSIssued =
+        /issued in the (u\.?s\.?a?|united states)|emitid[ao]s? (nos|em) (eua|estados unidos)|county (clerk|record)|clerk of (the )?(circuit )?court|\bflorida\b|\bflórida\b|state of [a-z]+.{0,12}(usa|u\.s)|us (marriage|birth)|american (marriage|birth)/i.test(
+          s
+        );
+      const looksEnglish = /already in english|in english|em ingl[eê]s|língua inglesa|lingua inglesa/.test(s);
+      if (looksUSIssued || looksEnglish) return false;
       return true;
     });
     if (filtered.length > 0) {
@@ -2985,6 +3144,14 @@ export function applyGovisaRules(args: RulesInput | RulesInputV2): Finding[] {
   // Cluster forms por sujeito
   const clusters = clusterFormsBySubject(forms, subjects);
 
+  // Item 2 (10/06): endereço do I-192 por sujeito (Part 2, item 10, pág. 3)
+  // — fonte definitiva do endereço físico atual. Usado no nível 1.
+  const i192AddrBySubject = new Map<string, Address | null>();
+  for (const [sid, cluster] of Array.from(clusters.entries())) {
+    const i192 = cluster.find((f) => f.form === "I-192") as any;
+    i192AddrBySubject.set(sid, i192?.physical_address ?? null);
+  }
+
   // Nível 1 — Per-form
   for (const f of forms) {
     const sid = getSubjectId(f);
@@ -2992,7 +3159,13 @@ export function applyGovisaRules(args: RulesInput | RulesInputV2): Finding[] {
       subjects.find((s) => s.id === sid) ??
       subjects.find((s) => s.role === "principal") ??
       null;
-    out.push(...applyLevel1PerForm(f, subject, { isDraft, proofOfAddress: v2.proofOfAddress }));
+    out.push(
+      ...applyLevel1PerForm(f, subject, {
+        isDraft,
+        proofOfAddress: v2.proofOfAddress,
+        i192Address: i192AddrBySubject.get(subject?.id ?? "") ?? null
+      })
+    );
   }
 
   // Nível 2 — Intra-cluster (cada cluster)
@@ -3043,6 +3216,7 @@ export function applyGovisaRules(args: RulesInput | RulesInputV2): Finding[] {
     RULE_IDS.T_FILING_PHYSICAL_ADDR_NEEDS_PROOF,
     RULE_IDS.T_FILING_PHYSICAL_ADDR_MISMATCH_PROOF,
     RULE_IDS.T_FILING_PHYSICAL_ADDR_PROOF_MISSING,
+    RULE_IDS.T_FILING_PHYSICAL_ADDR_DIVERGE_I192,
     RULE_IDS.T_FILING_PHYSICAL_ADDR_NOT_GOVISA,
     RULE_IDS.T_FILING_SAFE_MAILING_NOT_GOVISA,
     RULE_IDS.T_FILING_IN_CARE_OF_MISSING,

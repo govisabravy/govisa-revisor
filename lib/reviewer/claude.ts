@@ -937,13 +937,20 @@ const FORM_HINTS: Record<string, string> = {
 - "removal_proceedings" = true se indicou estar em processo de remoção.
 - "is_us_citizen" = true se o family member é declarado como cidadão americano (USC). Filhos americanos não precisam de I-914A.
 - "country_of_residence" = país onde o family member reside. Familiares fora dos EUA aparecem em consular processing.`,
-  "I-914A": `"location" = "US" se a pessoa está nos EUA, "abroad" se está no exterior.`,
+  "I-914A": `Dicas pro I-914A (Supplement A):
+- "location" = "US" se a pessoa está nos EUA, "abroad" se está no exterior.
+- RELATIONSHIP (CRÍTICO): "relationship_to_principal" vem EXCLUSIVAMENTE do CHECKBOX marcado na pergunta de relação do formulário (Spouse / Child / Parent / Sibling). Use a VISÃO pra ler qual caixa está marcada. NUNCA infira a relação por idade, nome ou sobrenome — um cônjuge pode ter qualquer idade e um filho pode ter sobrenome diferente. Se nenhuma caixa estiver legível, use null.
+- SEPARAÇÃO DE A-NUMBERS (CRÍTICO): o Supplement A menciona DUAS pessoas:
+  * Part 1 (e cabeçalhos) trazem dados do APLICANTE PRINCIPAL (T-1) — o A-Number dele vai em "principal_applicant.a_number" e NUNCA em "family_member".
+  * "family_member.a_number" e "family_member.a_numbers_seen" devem conter SOMENTE o A-Number do PRÓPRIO FAMILY MEMBER (a pessoa deste Supplement).
+  * As páginas finais "Additional Information" costumam repetir o A-Number do PRINCIPAL no cabeçalho — NÃO inclua esse número em family_member.a_numbers_seen.`,
   "I-914B": `IMPORTANTE para I-914B:
 - Part 1 é sobre a VÍTIMA (nome, A-Number, etc).
 - Part 2 é sobre o AGENTE DA LEI (Law Enforcement Officer) que assina — tipicamente preenchido pelo órgão, NUNCA deve ser pré-preenchido pelo advogado.
 - "part2_filled" = true se QUALQUER campo de Part 2 (Officer Name, Agency, Title, Signature, etc.) estiver preenchido; false se estiver totalmente em branco; null se ambíguo.
 - "part2_fields_filled" = lista de campos de Part 2 que você viu preenchidos (ex: ["Officer Full Name", "Agency Name"]).`,
-  "I-192": `Para "grounds_of_inadmissibility" liste os motivos marcados no form (ex: "INA 212(a)(6)(A) - entered without inspection", "INA 212(a)(9)(B) - unlawful presence", etc.).`,
+  "I-192": `Para "grounds_of_inadmissibility" liste os motivos marcados no form (ex: "INA 212(a)(6)(A) - entered without inspection", "INA 212(a)(9)(B) - unlawful presence", etc.).
+ENDEREÇO (CRÍTICO): "physical_address" deve vir do ITEM 10 da PART 2 (página 3) — "Applicant's Current Physical Address". Esse campo é a FONTE DEFINITIVA do endereço atual do requerente no processo. Copie-o exatamente como está (rua, apt, cidade, estado, zip). Não use endereços de outras seções/páginas do form para preencher physical_address.`,
   "I-765": `"attorney_bar_number" = Bar Number do advogado no rodapé da pág.1 ("Attorney State Bar Number (if applicable)"). Apenas dígitos. NÃO confundir com o A-Number do cliente.
 Categorias válidas em T-visa:
 - (c)(25) = T-1 principal; (a)(16) = T-1 ajustando; (c)(25) também cobre alguns; para T-2/3/4/5 derivativos os códigos variam.
@@ -1177,6 +1184,7 @@ EXCEÇÕES (NÃO precisam de tradução certificada):
 - Passaportes estrangeiros (biometric page): USCIS aceita passaportes na língua original; não precisam ser traduzidos.
 - Carteiras de identidade oficiais (RG, cédula de identidade, national ID card): quando apenas a foto é usada como evidência de identidade, tradução é dispensada.
 - Documentos já emitidos em inglês.
+- Certidões EMITIDAS NOS EUA (já em inglês): certidão de casamento americana (ex: Florida Marriage Record, county clerk), certidão de nascimento americana, ou qualquer registro civil emitido por autoridade dos EUA. A regra 8 CFR 103.2(b)(3) só alcança documentos em LÍNGUA ESTRANGEIRA — documento americano em inglês NUNCA deve aparecer em documents_without_translation.
 
 DEVEM ser traduzidos:
 - Certidões de nascimento, casamento, divórcio, óbito
@@ -1200,6 +1208,7 @@ EXCLUA da análise:
 - Passaportes (qualquer página)
 - Carteiras de identidade oficiais (RG, cédula, national ID) quando usadas só pra identificação
 - Documentos já em inglês
+- Certidões de casamento/nascimento EMITIDAS NOS EUA (Florida Marriage Record, county clerk, US birth certificate etc.) — já são em inglês, tradução dispensada
 
 INCLUA:
 - Certidões (nascimento, casamento, divórcio, óbito)

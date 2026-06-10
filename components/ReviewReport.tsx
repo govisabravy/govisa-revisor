@@ -328,7 +328,11 @@ export default function ReviewReportView({
                 >
                   {s.display_name}{" "}
                   <span className="opacity-60">
-                    · {s.role === "principal" ? "principal" : "dep"} · {count}
+                    · {s.role === "principal" ? "principal" : "dep"}
+                    {(s as any).relationship_to_principal
+                      ? ` (${(s as any).relationship_to_principal})`
+                      : ""}
+                    {(s as any).a_number ? ` · A# ${(s as any).a_number}` : ""} · {count}
                   </span>
                 </button>
               );

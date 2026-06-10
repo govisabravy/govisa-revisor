@@ -318,7 +318,11 @@ export const SubjectSchema = z.object({
   given_name: z.string().nullable().optional(),
   date_of_birth: z.string().nullable().optional(),
   country_of_citizenship: z.string().nullable().optional(),
-  relationship_to_principal: z.string().nullable().optional()
+  relationship_to_principal: z.string().nullable().optional(),
+  /** A-Number da PESSOA (item 4, 10/06): cada sujeito carrega o próprio A#. */
+  a_number: z.string().nullable().optional(),
+  /** Cidadania americana detectada (cluster validator / I-914 family members). */
+  is_us_citizen: z.boolean().nullable().optional()
 });
 export type Subject = z.infer<typeof SubjectSchema>;
 
