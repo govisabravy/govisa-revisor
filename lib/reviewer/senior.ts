@@ -506,10 +506,11 @@ Máximo 8 findings. Não emita findings se não houver evidência clara nos dado
         attempts++;
         const params: any = {
           model: MODEL,
-          // Fix 05/06: com adaptive thinking os tokens de raciocínio CONTAM no
-          // max_tokens. 16000 estourava (thinking-only / JSON truncado). 32000
-          // dá folga real pro thinking + JSON de saída.
-          max_tokens: useThinking ? 32000 : 12000,
+          // Fix 10/06: com adaptive thinking os tokens de raciocínio CONTAM no
+          // max_tokens. 32000 truncou em pacote grande (review 58a7d912); com
+          // streaming o sonnet-4-6 suporta 64k de output, então usamos o teto
+          // nas DUAS passadas (o retry sem thinking com 12k também truncava).
+          max_tokens: 64000,
           system: [
             {
               type: "text",
@@ -530,9 +531,10 @@ Máximo 8 findings. Não emita findings se não houver evidência clara nos dado
           params.thinking = { type: "adaptive" } as any;
           params.output_config = { effort: "high" } as any;
         }
-        // timeout explícito: sem ele o SDK lança "Streaming is strongly
-        // recommended" client-side quando max_tokens > ~21k (fix 05/06 r2).
-        return client.messages.create(params, { timeout: 600_000 });
+        // Fix 10/06: streaming + finalMessage() elimina o guard de 10 min do
+        // SDK e o risco de timeout HTTP em respostas longas (create já chegou
+        // a 474s; com 64k de output o create estouraria o teto de 600s).
+        return client.messages.stream(params).finalMessage();
       });
     } catch (err) {
       caughtErr = err;
@@ -838,10 +840,9 @@ Use a tool report_adversarial_decisions e devolva exatamente uma decisão por fi
         attempts++;
         const params: any = {
           model: MODEL,
-          // Fix 05/06: com adaptive thinking os tokens de raciocínio CONTAM no
-          // max_tokens. 16000 estourava (thinking-only / JSON truncado). 32000
-          // dá folga real pro thinking + JSON de saída.
-          max_tokens: useThinking ? 32000 : 12000,
+          // Fix 10/06: 32000 truncava em pacote grande; com streaming o
+          // sonnet-4-6 suporta 64k de output. Teto nas duas passadas.
+          max_tokens: 64000,
           system: [
             {
               type: "text",
@@ -878,9 +879,9 @@ Use a tool report_adversarial_decisions e devolva exatamente uma decisão por fi
             name: "report_adversarial_decisions"
           } as any;
         }
-        // timeout explícito: sem ele o SDK lança "Streaming is strongly
-        // recommended" client-side quando max_tokens > ~21k (fix 05/06 r2).
-        return client.messages.create(params, { timeout: 600_000 });
+        // Fix 10/06: streaming + finalMessage() elimina o guard de 10 min do
+        // SDK e o risco de timeout HTTP em respostas longas com 64k de output.
+        return client.messages.stream(params).finalMessage();
       });
     } catch (err) {
       caughtErr = err;

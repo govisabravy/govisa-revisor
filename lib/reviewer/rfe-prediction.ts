@@ -594,8 +594,9 @@ Cada predição deve incluir trigger_findings com referência aos rule_ids/campo
     try {
       const params: any = {
         model: MODEL,
-        // Fix 05/06: thinking tokens contam no max_tokens; 16000 estourava.
-        max_tokens: useThinking ? 32000 : 12000,
+        // Fix 10/06: 32000 era apertado em pacote grande; com streaming o
+        // sonnet-4-6 suporta 64k de output. Teto nas duas passadas.
+        max_tokens: 64000,
         system: [
           {
             type: "text",
@@ -627,9 +628,10 @@ Cada predição deve incluir trigger_findings com referência aos rule_ids/campo
       } else {
         params.tool_choice = { type: "tool", name: LLM_TOOL_NAME } as any;
       }
-      // timeout explícito: sem ele o SDK lança "Streaming is strongly
-      // recommended" client-side quando max_tokens > ~21k (fix 05/06 r2).
-      res = await client.messages.create(params, { timeout: 600_000 });
+      // Fix 10/06: streaming + finalMessage() elimina o guard de 10 min do
+      // SDK e o risco de timeout HTTP (predictRFEs chegou a 474s com create;
+      // com 64k de output o create estouraria o teto de 600s).
+      res = await client.messages.stream(params).finalMessage();
     } catch (err) {
       caughtErr = err;
     }

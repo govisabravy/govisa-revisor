@@ -511,8 +511,9 @@ Use a tool ${TOOL_NAME} para reportar correções, novos sujeitos, órfãos e am
       attempts++;
       const params: any = {
         model: MODEL,
-        // Fix 05/06: thinking tokens contam no max_tokens; folga maior.
-        max_tokens: 32000,
+        // Fix 10/06: com streaming o sonnet-4-6 suporta 64k de output;
+        // teto elimina truncamento em pacote grande.
+        max_tokens: 64000,
         // claude-opus-4-7 só aceita adaptive thinking; "enabled"+budget_tokens dá 400.
         thinking: { type: "adaptive" } as any,
         output_config: { effort: "high" } as any,
@@ -541,9 +542,9 @@ Use a tool ${TOOL_NAME} para reportar correções, novos sujeitos, órfãos e am
           }
         ]
       };
-      // timeout explícito: sem ele o SDK lança "Streaming is strongly
-      // recommended" client-side quando max_tokens > ~21k (fix 05/06 r2).
-      return client.messages.create(params, { timeout: 600_000 });
+      // Fix 10/06: streaming + finalMessage() elimina o guard de 10 min do
+      // SDK e o risco de timeout HTTP em respostas longas com 64k de output.
+      return client.messages.stream(params).finalMessage();
     });
   } catch (err) {
     caughtErr = err;
