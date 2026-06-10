@@ -159,7 +159,10 @@ function getClient(): Anthropic {
   }
   return new Anthropic({
     apiKey: apiKey ?? "placeholder",
-    authToken
+    authToken,
+    // timeout no construtor: o guard "Streaming is strongly recommended" do SDK
+    // so e suprimido por _options.timeout do client; timeout per-request nao evita o throw
+    timeout: 600_000
   });
 }
 

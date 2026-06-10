@@ -20,7 +20,10 @@ const MODEL = process.env.ANTHROPIC_MODEL ?? "claude-opus-4-7";
 function client() {
   return new Anthropic({
     apiKey: process.env.ANTHROPIC_API_KEY ?? "placeholder",
-    authToken: process.env.ANTHROPIC_AUTH_TOKEN
+    authToken: process.env.ANTHROPIC_AUTH_TOKEN,
+    // timeout no construtor: o guard "Streaming is strongly recommended" do SDK
+    // so e suprimido por _options.timeout do client; timeout per-request nao evita o throw
+    timeout: 600_000
   });
 }
 
