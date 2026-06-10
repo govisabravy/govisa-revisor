@@ -527,7 +527,9 @@ Máximo 8 findings. Não emita findings se não houver evidência clara nos dado
           params.thinking = { type: "adaptive" } as any;
           params.output_config = { effort: "high" } as any;
         }
-        return client.messages.create(params);
+        // timeout explícito: sem ele o SDK lança "Streaming is strongly
+        // recommended" client-side quando max_tokens > ~21k (fix 05/06 r2).
+        return client.messages.create(params, { timeout: 600_000 });
       });
     } catch (err) {
       caughtErr = err;
@@ -873,7 +875,9 @@ Use a tool report_adversarial_decisions e devolva exatamente uma decisão por fi
             name: "report_adversarial_decisions"
           } as any;
         }
-        return client.messages.create(params);
+        // timeout explícito: sem ele o SDK lança "Streaming is strongly
+        // recommended" client-side quando max_tokens > ~21k (fix 05/06 r2).
+        return client.messages.create(params, { timeout: 600_000 });
       });
     } catch (err) {
       caughtErr = err;

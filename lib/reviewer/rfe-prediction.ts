@@ -624,7 +624,9 @@ Cada predição deve incluir trigger_findings com referência aos rule_ids/campo
       } else {
         params.tool_choice = { type: "tool", name: LLM_TOOL_NAME } as any;
       }
-      res = await client.messages.create(params);
+      // timeout explícito: sem ele o SDK lança "Streaming is strongly
+      // recommended" client-side quando max_tokens > ~21k (fix 05/06 r2).
+      res = await client.messages.create(params, { timeout: 600_000 });
     } catch (err) {
       caughtErr = err;
     }

@@ -538,7 +538,9 @@ Use a tool ${TOOL_NAME} para reportar correções, novos sujeitos, órfãos e am
           }
         ]
       };
-      return client.messages.create(params);
+      // timeout explícito: sem ele o SDK lança "Streaming is strongly
+      // recommended" client-side quando max_tokens > ~21k (fix 05/06 r2).
+      return client.messages.create(params, { timeout: 600_000 });
     });
   } catch (err) {
     caughtErr = err;
