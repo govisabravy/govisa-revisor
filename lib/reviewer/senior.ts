@@ -21,6 +21,7 @@ import type {
 } from "../schemas/uvisa";
 import type { PassportSignatureCheck, UsageEvent } from "./claude";
 import { onUsage, emitUsage } from "./claude";
+import { stripJsonFences } from "./json-utils";
 
 // Senior pass é best-effort. Pode ser desabilitado por env.
 const SENIOR_PASS_ENABLED = process.env.REVIEWER_SENIOR_PASS !== "off";
@@ -162,11 +163,6 @@ function getClient(): Anthropic {
   });
 }
 
-function stripJsonFences(txt: string): string {
-  const m = txt.match(/```(?:json)?\s*([\s\S]*?)```/);
-  return (m ? m[1] : txt).trim();
-}
-
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -241,7 +237,6 @@ const SeniorOutputSchema = z.object({
         subject_id: z.string().nullable().optional()
       })
     )
-    .max(8)
 });
 
 const SENIOR_SYSTEM = `Você é um advogado de imigração SÊNIOR especializado em T-visa, U-visa e VAWA, revisando um filing montado pela Go Visa Law Firm. Você revisa milhares de casos por ano e tem padrão de raciocínio próximo de adjudicador USCIS.
@@ -508,7 +503,10 @@ Máximo 8 findings. Não emita findings se não houver evidência clara nos dado
         attempts++;
         const params: any = {
           model: MODEL,
-          max_tokens: useThinking ? 16000 : 12000,
+          // Fix 05/06: com adaptive thinking os tokens de raciocínio CONTAM no
+          // max_tokens. 16000 estourava (thinking-only / JSON truncado). 32000
+          // dá folga real pro thinking + JSON de saída.
+          max_tokens: useThinking ? 32000 : 12000,
           system: [
             {
               type: "text",
@@ -537,112 +535,111 @@ Máximo 8 findings. Não emita findings se não houver evidência clara nos dado
     return { res, attempts, startedAt, caughtErr };
   }
 
-  let { res, attempts, startedAt, caughtErr } = await callOnce(true);
+  // Fluxo com retry (fix 05/06): a 1ª tentativa usa adaptive thinking. Se a
+  // resposta vier truncada (stop_reason=max_tokens), sem bloco de texto
+  // (thinking-only) ou com JSON inválido/Zod fail, retentamos UMA vez sem
+  // thinking — aí todo o max_tokens fica disponível pro JSON de saída.
+  let findings: Finding[] | null = null;
 
-  // Caso erro de rede/SDK: emite ok=false e sai.
-  if (caughtErr) {
-    const ev = buildSeniorUsageEvent({ res, startedAt, attempts, caughtErr });
-    emitUsage(ev);
-    console.error("seniorCrossCheck failed:", ev.error);
-    return [];
-  }
+  for (let pass = 0; pass < 2 && findings === null; pass++) {
+    const useThinking = pass === 0;
+    const { res, attempts, startedAt, caughtErr } = await callOnce(useThinking);
 
-  // Diagnostica response. Se não tem text mas tem thinking, retenta sem thinking.
-  let diag = diagnoseResponse(res);
-  if (!diag.has_text) {
-    const errFromThinking = diagnosticToErrorMsg(
-      diag,
-      "thinking-only response (no text/tool_use)"
-    );
-    // Emite primeiro evento como falha (telemetria do problema), depois retenta.
-    emitUsage(
-      buildSeniorUsageEvent({
-        res,
-        startedAt,
-        attempts,
-        caughtErr: null,
-        errorOverride: errFromThinking
-      })
-    );
-    console.warn(
-      "[seniorCrossCheck] retry sem thinking após response sem text:",
-      errFromThinking.slice(0, 250)
-    );
-    const retry = await callOnce(false);
-    res = retry.res;
-    attempts = retry.attempts;
-    startedAt = retry.startedAt;
-    caughtErr = retry.caughtErr;
     if (caughtErr) {
       const ev = buildSeniorUsageEvent({ res, startedAt, attempts, caughtErr });
-      emitUsage(ev);
-      console.error("seniorCrossCheck retry failed:", ev.error);
-      return [];
-    }
-    diag = diagnoseResponse(res);
-    if (!diag.has_text) {
-      const ev = buildSeniorUsageEvent({
-        res,
-        startedAt,
-        attempts,
-        caughtErr: null,
-        errorOverride: diagnosticToErrorMsg(
-          diag,
-          "retry sem thinking ainda sem text"
-        )
-      });
       emitUsage(ev);
       console.error("seniorCrossCheck failed:", ev.error);
       return [];
     }
-  }
 
-  const textBlock = (res.content ?? []).find((b: any) => b?.type === "text");
-  const raw = stripJsonFences(textBlock.text);
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (err: any) {
-    const ev = buildSeniorUsageEvent({
-      res,
-      startedAt,
-      attempts,
-      caughtErr: null,
-      errorOverride: `JSON parse error: ${String(err?.message ?? err).slice(
+    const diag = diagnoseResponse(res);
+    if (!diag.has_text || diag.stop_reason === "max_tokens") {
+      const errMsg = diagnosticToErrorMsg(
+        diag,
+        !diag.has_text
+          ? "thinking-only response (no text/tool_use)"
+          : "response truncada (stop_reason=max_tokens)"
+      );
+      emitUsage(
+        buildSeniorUsageEvent({
+          res,
+          startedAt,
+          attempts,
+          caughtErr: null,
+          errorOverride: errMsg
+        })
+      );
+      if (pass === 0) {
+        console.warn("[seniorCrossCheck] retry sem thinking:", errMsg.slice(0, 250));
+        continue;
+      }
+      console.error("seniorCrossCheck failed:", errMsg);
+      return [];
+    }
+
+    const textBlock = (res.content ?? []).find((b: any) => b?.type === "text");
+    const raw = stripJsonFences(textBlock.text);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err: any) {
+      const errMsg = `JSON parse error: ${String(err?.message ?? err).slice(
         0,
         150
-      )} | text_preview=${JSON.stringify(raw.slice(0, 500))}`
-    });
-    emitUsage(ev);
-    console.error("seniorCrossCheck failed:", ev.error);
-    return [];
-  }
+      )} | stop_reason=${diag.stop_reason} | text_preview=${JSON.stringify(raw.slice(0, 500))}`;
+      emitUsage(
+        buildSeniorUsageEvent({
+          res,
+          startedAt,
+          attempts,
+          caughtErr: null,
+          errorOverride: errMsg
+        })
+      );
+      if (pass === 0) {
+        console.warn("[seniorCrossCheck] retry sem thinking após JSON parse error");
+        continue;
+      }
+      console.error("seniorCrossCheck failed:", errMsg);
+      return [];
+    }
 
-  const result = SeniorOutputSchema.safeParse(parsed);
-  if (!result.success) {
-    const issues = result.error.issues
-      .slice(0, 3)
-      .map((i) => `${i.path.join(".")}: ${i.message}`)
-      .join("; ")
-      .slice(0, 300);
-    const ev = buildSeniorUsageEvent({
-      res,
-      startedAt,
-      attempts,
-      caughtErr: null,
-      errorOverride: `Zod validation: ${issues} | text_preview=${JSON.stringify(
+    const result = SeniorOutputSchema.safeParse(parsed);
+    if (!result.success) {
+      const issues = result.error.issues
+        .slice(0, 3)
+        .map((i) => `${i.path.join(".")}: ${i.message}`)
+        .join("; ")
+        .slice(0, 300);
+      const errMsg = `Zod validation: ${issues} | text_preview=${JSON.stringify(
         raw.slice(0, 500)
-      )}`
-    });
-    emitUsage(ev);
-    console.error("seniorCrossCheck failed:", ev.error);
-    return [];
+      )}`;
+      emitUsage(
+        buildSeniorUsageEvent({
+          res,
+          startedAt,
+          attempts,
+          caughtErr: null,
+          errorOverride: errMsg
+        })
+      );
+      if (pass === 0) {
+        console.warn("[seniorCrossCheck] retry sem thinking após Zod fail");
+        continue;
+      }
+      console.error("seniorCrossCheck failed:", errMsg);
+      return [];
+    }
+
+    // Sucesso: emite evento final com ok=true.
+    emitUsage(buildSeniorUsageEvent({ res, startedAt, attempts, caughtErr: null }));
+
+    // Cap de 8 aplicado pós-parse (antes era .max(8) no Zod, que derrubava a
+    // resposta INTEIRA quando o modelo passava do cap).
+    findings = (result.data.findings as Finding[]).slice(0, 8);
   }
 
-  // Sucesso: emite evento final com ok=true.
-  emitUsage(buildSeniorUsageEvent({ res, startedAt, attempts, caughtErr: null }));
-
-  let findings = result.data.findings as Finding[];
+  if (findings === null) return [];
 
   // Rede de segurança: se modo draft, suprimir findings de assinatura mesmo
   // que o LLM tenha ignorado a regra 0 do system prompt.
@@ -836,7 +833,10 @@ Use a tool report_adversarial_decisions e devolva exatamente uma decisão por fi
         attempts++;
         const params: any = {
           model: MODEL,
-          max_tokens: useThinking ? 16000 : 12000,
+          // Fix 05/06: com adaptive thinking os tokens de raciocínio CONTAM no
+          // max_tokens. 16000 estourava (thinking-only / JSON truncado). 32000
+          // dá folga real pro thinking + JSON de saída.
+          max_tokens: useThinking ? 32000 : 12000,
           system: [
             {
               type: "text",
@@ -881,161 +881,143 @@ Use a tool report_adversarial_decisions e devolva exatamente uma decisão por fi
     return { res, attempts, startedAt, caughtErr };
   }
 
-  let { res, attempts, startedAt, caughtErr } = await callOnce(true);
+  // Fluxo com retry (fix 05/06): 1ª tentativa com adaptive thinking. Se a
+  // resposta vier truncada (stop_reason=max_tokens), só com thinking, ou com
+  // JSON/Zod inválido, retenta UMA vez sem thinking (tool_choice forçado).
+  for (let pass = 0; pass < 2; pass++) {
+    const useThinking = pass === 0;
+    const { res, attempts, startedAt, caughtErr } = await callOnce(useThinking);
 
-  if (caughtErr) {
-    const ev = buildAdversarialUsageEvent({
-      res,
-      startedAt,
-      attempts,
-      caughtErr
-    });
-    emitUsage(ev);
-    console.error("adversarialReview failed:", ev.error);
-    return [];
-  }
-
-  let diag = diagnoseResponse(res, "report_adversarial_decisions");
-  if (!diag.has_tool_use && !diag.has_text) {
-    const errFromThinking = diagnosticToErrorMsg(
-      diag,
-      "thinking-only response (no tool_use/text)"
-    );
-    emitUsage(
-      buildAdversarialUsageEvent({
-        res,
-        startedAt,
-        attempts,
-        caughtErr: null,
-        errorOverride: errFromThinking
-      })
-    );
-    console.warn(
-      "[adversarialReview] retry sem thinking após response sem tool_use/text:",
-      errFromThinking.slice(0, 250)
-    );
-    const retry = await callOnce(false);
-    res = retry.res;
-    attempts = retry.attempts;
-    startedAt = retry.startedAt;
-    caughtErr = retry.caughtErr;
     if (caughtErr) {
-      const ev = buildAdversarialUsageEvent({
-        res,
-        startedAt,
-        attempts,
-        caughtErr
-      });
-      emitUsage(ev);
-      console.error("adversarialReview retry failed:", ev.error);
-      return [];
-    }
-    diag = diagnoseResponse(res, "report_adversarial_decisions");
-    if (!diag.has_tool_use && !diag.has_text) {
-      const ev = buildAdversarialUsageEvent({
-        res,
-        startedAt,
-        attempts,
-        caughtErr: null,
-        errorOverride: diagnosticToErrorMsg(
-          diag,
-          "retry sem thinking ainda sem tool_use/text"
-        )
-      });
+      const ev = buildAdversarialUsageEvent({ res, startedAt, attempts, caughtErr });
       emitUsage(ev);
       console.error("adversarialReview failed:", ev.error);
       return [];
     }
-  }
 
-  // Com tool_choice forçado (no retry) ou tool_use opcional (na 1a tentativa),
-  // esperamos um content block do tipo "tool_use".
-  const toolBlock = (res.content ?? []).find(
-    (b: any) => b?.type === "tool_use" && b?.name === "report_adversarial_decisions"
-  );
-
-  let parsed: unknown;
-  if (toolBlock && toolBlock.input && typeof toolBlock.input === "object") {
-    parsed = toolBlock.input;
-  } else {
-    // Fallback: tenta extrair texto se por algum motivo não vier tool_use.
-    const textBlock = (res.content ?? []).find((b: any) => b?.type === "text");
-    if (!textBlock || typeof textBlock.text !== "string") {
-      const ev = buildAdversarialUsageEvent({
-        res,
-        startedAt,
-        attempts,
-        caughtErr: null,
-        errorOverride: diagnosticToErrorMsg(
-          diagnoseResponse(res, "report_adversarial_decisions"),
-          "no tool_use, no text"
-        )
-      });
-      emitUsage(ev);
-      console.error("adversarialReview failed:", ev.error);
+    const diag = diagnoseResponse(res, "report_adversarial_decisions");
+    if ((!diag.has_tool_use && !diag.has_text) || diag.stop_reason === "max_tokens") {
+      const errMsg = diagnosticToErrorMsg(
+        diag,
+        !diag.has_tool_use && !diag.has_text
+          ? "thinking-only response (no tool_use/text)"
+          : "response truncada (stop_reason=max_tokens)"
+      );
+      emitUsage(
+        buildAdversarialUsageEvent({
+          res,
+          startedAt,
+          attempts,
+          caughtErr: null,
+          errorOverride: errMsg
+        })
+      );
+      if (pass === 0) {
+        console.warn("[adversarialReview] retry sem thinking:", errMsg.slice(0, 250));
+        continue;
+      }
+      console.error("adversarialReview failed:", errMsg);
       return [];
     }
-    try {
-      parsed = JSON.parse(stripJsonFences(textBlock.text));
-    } catch (err: any) {
-      const ev = buildAdversarialUsageEvent({
-        res,
-        startedAt,
-        attempts,
-        caughtErr: null,
-        errorOverride: `JSON parse error: ${String(err?.message ?? err).slice(
+
+    const toolBlock = (res.content ?? []).find(
+      (b: any) => b?.type === "tool_use" && b?.name === "report_adversarial_decisions"
+    );
+
+    let parsed: unknown;
+    if (toolBlock && toolBlock.input && typeof toolBlock.input === "object") {
+      parsed = toolBlock.input;
+    } else {
+      // Fallback: tenta extrair texto se por algum motivo não vier tool_use.
+      const textBlock = (res.content ?? []).find((b: any) => b?.type === "text");
+      if (!textBlock || typeof textBlock.text !== "string") {
+        const errMsg = diagnosticToErrorMsg(diag, "no tool_use, no text");
+        emitUsage(
+          buildAdversarialUsageEvent({
+            res,
+            startedAt,
+            attempts,
+            caughtErr: null,
+            errorOverride: errMsg
+          })
+        );
+        if (pass === 0) continue;
+        console.error("adversarialReview failed:", errMsg);
+        return [];
+      }
+      try {
+        parsed = JSON.parse(stripJsonFences(textBlock.text));
+      } catch (err: any) {
+        const errMsg = `JSON parse error: ${String(err?.message ?? err).slice(
           0,
           150
-        )} | text_preview=${JSON.stringify(textBlock.text.slice(0, 500))}`
-      });
-      emitUsage(ev);
-      console.error("adversarialReview failed:", ev.error);
+        )} | text_preview=${JSON.stringify(textBlock.text.slice(0, 500))}`;
+        emitUsage(
+          buildAdversarialUsageEvent({
+            res,
+            startedAt,
+            attempts,
+            caughtErr: null,
+            errorOverride: errMsg
+          })
+        );
+        if (pass === 0) {
+          console.warn("[adversarialReview] retry sem thinking após JSON parse error");
+          continue;
+        }
+        console.error("adversarialReview failed:", errMsg);
+        return [];
+      }
+    }
+
+    const result = AdversarialOutputSchema.safeParse(parsed);
+    if (!result.success) {
+      const issues = result.error.issues
+        .slice(0, 3)
+        .map((i) => `${i.path.join(".")}: ${i.message}`)
+        .join("; ")
+        .slice(0, 300);
+      const errMsg = `Zod validation: ${issues} | parsed_preview=${jsonClip(parsed, 500)}`;
+      emitUsage(
+        buildAdversarialUsageEvent({
+          res,
+          startedAt,
+          attempts,
+          caughtErr: null,
+          errorOverride: errMsg
+        })
+      );
+      if (pass === 0) {
+        console.warn("[adversarialReview] retry sem thinking após Zod fail");
+        continue;
+      }
+      console.error("adversarialReview failed:", errMsg);
       return [];
     }
-  }
 
-  const result = AdversarialOutputSchema.safeParse(parsed);
-  if (!result.success) {
-    const issues = result.error.issues
-      .slice(0, 3)
-      .map((i) => `${i.path.join(".")}: ${i.message}`)
-      .join("; ")
-      .slice(0, 300);
-    const ev = buildAdversarialUsageEvent({
-      res,
-      startedAt,
-      attempts,
-      caughtErr: null,
-      errorOverride: `Zod validation: ${issues} | parsed_preview=${jsonClip(
-        parsed,
-        500
-      )}`
+    // Sucesso.
+    emitUsage(
+      buildAdversarialUsageEvent({ res, startedAt, attempts, caughtErr: null })
+    );
+
+    // Normaliza: weakened_severity null vira undefined; só mantém se verdict === "weaken".
+    const decisions: AdversarialDecision[] = result.data.decisions.map((d) => {
+      const out: AdversarialDecision = {
+        finding_index: d.finding_index,
+        rule_id: d.rule_id,
+        verdict: d.verdict,
+        reason: d.reason
+      };
+      if (d.verdict === "weaken" && d.weakened_severity) {
+        out.weakened_severity = d.weakened_severity;
+      }
+      return out;
     });
-    emitUsage(ev);
-    console.error("adversarialReview failed:", ev.error);
-    return [];
+
+    return decisions;
   }
 
-  // Sucesso.
-  emitUsage(
-    buildAdversarialUsageEvent({ res, startedAt, attempts, caughtErr: null })
-  );
-
-  // Normaliza: weakened_severity null vira undefined; só mantém se verdict === "weaken".
-  const decisions: AdversarialDecision[] = result.data.decisions.map((d) => {
-    const out: AdversarialDecision = {
-      finding_index: d.finding_index,
-      rule_id: d.rule_id,
-      verdict: d.verdict,
-      reason: d.reason
-    };
-    if (d.verdict === "weaken" && d.weakened_severity) {
-      out.weakened_severity = d.weakened_severity;
-    }
-    return out;
-  });
-
-  return decisions;
+  return [];
 }
 
 export async function adversarialReview(

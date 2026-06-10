@@ -14,6 +14,7 @@ import type { I360Form, VawaStoryFacts } from "../schemas/vawa";
 import type { I918Form, I918BForm, UVisaStoryFacts } from "../schemas/uvisa";
 import type { PassportSignatureCheck, UsageEvent } from "./claude";
 import { emitUsage } from "./claude";
+import { stripJsonFences } from "./json-utils";
 
 // =============================================================================
 // RFE Prediction Layer
@@ -590,7 +591,8 @@ Cada predição deve incluir trigger_findings com referência aos rule_ids/campo
     try {
       const params: any = {
         model: MODEL,
-        max_tokens: useThinking ? 16000 : 12000,
+        // Fix 05/06: thinking tokens contam no max_tokens; 16000 estourava.
+        max_tokens: useThinking ? 32000 : 12000,
         system: [
           {
             type: "text",
@@ -627,15 +629,6 @@ Cada predição deve incluir trigger_findings com referência aos rule_ids/campo
       caughtErr = err;
     }
     return { res, attempts, startedAt, caughtErr };
-  }
-
-  let { res, attempts, startedAt, caughtErr } = await callOnce(true);
-
-  if (caughtErr) {
-    const ev = buildRfeUsageEvent({ res, startedAt, attempts, caughtErr });
-    emitUsage(ev);
-    console.error("predictRFEs LLM refine falhou:", ev.error);
-    return null;
   }
 
   function diagnose(r: any): {
@@ -682,123 +675,128 @@ Cada predição deve incluir trigger_findings com referência aos rule_ids/campo
     return parts.join(" | ").slice(0, 1500);
   }
 
-  let diag = diagnose(res);
-  if (!diag.has_tool_use && !diag.has_text) {
-    const errFromThinking = diagToErr(
-      diag,
-      "thinking-only response (no tool_use/text)"
-    );
-    emitUsage(
-      buildRfeUsageEvent({
-        res,
-        startedAt,
-        attempts,
-        caughtErr: null,
-        errorOverride: errFromThinking
-      })
-    );
-    console.warn(
-      "[predictRFEs] retry sem thinking após response sem tool_use/text:",
-      errFromThinking.slice(0, 250)
-    );
-    const retry = await callOnce(false);
-    res = retry.res;
-    attempts = retry.attempts;
-    startedAt = retry.startedAt;
-    caughtErr = retry.caughtErr;
+  // Fluxo com retry (fix 05/06): 1ª tentativa com adaptive thinking. Se vier
+  // truncada (stop_reason=max_tokens — caso da review 5eab5923: tool input
+  // vazio com output_tokens=16000), thinking-only, ou JSON/Zod inválido,
+  // retenta UMA vez sem thinking (tool_choice forçado).
+  for (let pass = 0; pass < 2; pass++) {
+    const useThinking = pass === 0;
+    const { res, attempts, startedAt, caughtErr } = await callOnce(useThinking);
+
     if (caughtErr) {
       const ev = buildRfeUsageEvent({ res, startedAt, attempts, caughtErr });
-      emitUsage(ev);
-      console.error("predictRFEs LLM refine retry failed:", ev.error);
-      return null;
-    }
-    diag = diagnose(res);
-    if (!diag.has_tool_use && !diag.has_text) {
-      const ev = buildRfeUsageEvent({
-        res,
-        startedAt,
-        attempts,
-        caughtErr: null,
-        errorOverride: diagToErr(diag, "retry sem thinking ainda sem tool_use/text")
-      });
       emitUsage(ev);
       console.error("predictRFEs LLM refine falhou:", ev.error);
       return null;
     }
-  }
 
-  const toolBlock = (res?.content ?? []).find(
-    (b: any) => b?.type === "tool_use" && b?.name === LLM_TOOL_NAME
-  );
-
-  let parsed: unknown = null;
-  if (toolBlock && toolBlock.input && typeof toolBlock.input === "object") {
-    parsed = toolBlock.input;
-  } else {
-    // fallback texto
-    const textBlock = (res?.content ?? []).find((b: any) => b?.type === "text");
-    if (textBlock && typeof textBlock.text === "string") {
-      try {
-        // Heurística: tentar extrair JSON inline.
-        const m = textBlock.text.match(/```(?:json)?\s*([\s\S]*?)```/);
-        const raw = (m ? m[1] : textBlock.text).trim();
-        parsed = JSON.parse(raw);
-      } catch (err: any) {
-        const ev = buildRfeUsageEvent({
+    const diag = diagnose(res);
+    if ((!diag.has_tool_use && !diag.has_text) || diag.stop_reason === "max_tokens") {
+      const errMsg = diagToErr(
+        diag,
+        !diag.has_tool_use && !diag.has_text
+          ? "thinking-only response (no tool_use/text)"
+          : "response truncada (stop_reason=max_tokens)"
+      );
+      emitUsage(
+        buildRfeUsageEvent({
           res,
           startedAt,
           attempts,
           caughtErr: null,
-          errorOverride: `JSON parse fallback failed: ${String(
-            err?.message ?? err
-          ).slice(0, 150)} | text_preview=${JSON.stringify(
-            textBlock.text.slice(0, 500)
-          )}`
-        });
-        emitUsage(ev);
-        console.error("predictRFEs LLM refine falhou:", ev.error);
-        return null;
+          errorOverride: errMsg
+        })
+      );
+      if (pass === 0) {
+        console.warn("[predictRFEs] retry sem thinking:", errMsg.slice(0, 250));
+        continue;
       }
-    } else {
-      const ev = buildRfeUsageEvent({
-        res,
-        startedAt,
-        attempts,
-        caughtErr: null,
-        errorOverride: diagToErr(diagnose(res), "no tool_use, no text")
-      });
-      emitUsage(ev);
-      console.error("predictRFEs LLM refine falhou:", ev.error);
+      console.error("predictRFEs LLM refine falhou:", errMsg);
       return null;
     }
+
+    const toolBlock = (res?.content ?? []).find(
+      (b: any) => b?.type === "tool_use" && b?.name === LLM_TOOL_NAME
+    );
+
+    let parsed: unknown = null;
+    if (toolBlock && toolBlock.input && typeof toolBlock.input === "object") {
+      parsed = toolBlock.input;
+    } else {
+      // fallback texto
+      const textBlock = (res?.content ?? []).find((b: any) => b?.type === "text");
+      if (!textBlock || typeof textBlock.text !== "string") {
+        const errMsg = diagToErr(diagnose(res), "no tool_use, no text");
+        emitUsage(
+          buildRfeUsageEvent({
+            res,
+            startedAt,
+            attempts,
+            caughtErr: null,
+            errorOverride: errMsg
+          })
+        );
+        if (pass === 0) continue;
+        console.error("predictRFEs LLM refine falhou:", errMsg);
+        return null;
+      }
+      try {
+        parsed = JSON.parse(stripJsonFences(textBlock.text));
+      } catch (err: any) {
+        const errMsg = `JSON parse fallback failed: ${String(
+          err?.message ?? err
+        ).slice(0, 150)} | text_preview=${JSON.stringify(
+          textBlock.text.slice(0, 500)
+        )}`;
+        emitUsage(
+          buildRfeUsageEvent({
+            res,
+            startedAt,
+            attempts,
+            caughtErr: null,
+            errorOverride: errMsg
+          })
+        );
+        if (pass === 0) {
+          console.warn("[predictRFEs] retry sem thinking após JSON parse error");
+          continue;
+        }
+        console.error("predictRFEs LLM refine falhou:", errMsg);
+        return null;
+      }
+    }
+
+    const result = RFEOutputSchema.safeParse(parsed);
+    if (!result.success) {
+      const issues = result.error.issues
+        .slice(0, 3)
+        .map((i) => `${i.path.join(".")}: ${i.message}`)
+        .join("; ")
+        .slice(0, 300);
+      const errMsg = `Zod validation: ${issues} | parsed_preview=${jsonClip(parsed, 500)}`;
+      emitUsage(
+        buildRfeUsageEvent({
+          res,
+          startedAt,
+          attempts,
+          caughtErr: null,
+          errorOverride: errMsg
+        })
+      );
+      if (pass === 0) {
+        console.warn("[predictRFEs] retry sem thinking após Zod fail");
+        continue;
+      }
+      console.error("predictRFEs LLM refine falhou:", errMsg);
+      return null;
+    }
+
+    // Sucesso.
+    emitUsage(buildRfeUsageEvent({ res, startedAt, attempts, caughtErr: null }));
+    return result.data.predictions as RFEPrediction[];
   }
 
-  const result = RFEOutputSchema.safeParse(parsed);
-  if (!result.success) {
-    const issues = result.error.issues
-      .slice(0, 3)
-      .map((i) => `${i.path.join(".")}: ${i.message}`)
-      .join("; ")
-      .slice(0, 300);
-    const ev = buildRfeUsageEvent({
-      res,
-      startedAt,
-      attempts,
-      caughtErr: null,
-      errorOverride: `Zod validation: ${issues} | parsed_preview=${jsonClip(
-        parsed,
-        500
-      )}`
-    });
-    emitUsage(ev);
-    console.error("predictRFEs LLM refine falhou:", ev.error);
-    return null;
-  }
-
-  // Sucesso.
-  emitUsage(buildRfeUsageEvent({ res, startedAt, attempts, caughtErr: null }));
-
-  return result.data.predictions as RFEPrediction[];
+  return null;
 }
 
 // =============================================================================

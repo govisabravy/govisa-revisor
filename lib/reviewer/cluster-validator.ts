@@ -508,7 +508,8 @@ Use a tool ${TOOL_NAME} para reportar correções, novos sujeitos, órfãos e am
       attempts++;
       const params: any = {
         model: MODEL,
-        max_tokens: 16000,
+        // Fix 05/06: thinking tokens contam no max_tokens; folga maior.
+        max_tokens: 32000,
         // claude-opus-4-7 só aceita adaptive thinking; "enabled"+budget_tokens dá 400.
         thinking: { type: "adaptive" } as any,
         output_config: { effort: "high" } as any,

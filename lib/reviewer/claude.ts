@@ -1,5 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { FormData, StoryFacts, ProofOfAddressAnalysis } from "../schemas/forms";
+import { stripJsonFences } from "./json-utils";
+import { fitPdfForClaude, rasterizePdfBase64 } from "./pdf-fit";
 
 export type DocKind =
   | "cover_letter"
@@ -52,9 +54,25 @@ function getClient(): Anthropic {
   });
 }
 
-function stripJsonFences(txt: string): string {
-  const m = txt.match(/```(?:json)?\s*([\s\S]*?)```/);
-  return (m ? m[1] : txt).trim();
+// stripJsonFences agora vive em ./json-utils (strip robusto: fences truncadas,
+// prosa em volta do JSON etc. — fix 05/06).
+
+function isRequestTooLarge(err: any): boolean {
+  const status = err?.status ?? err?.response?.status;
+  if (status === 413) return true;
+  return /request_too_large/i.test(String(err?.message ?? ""));
+}
+
+function buildUserContent(pdfBase64: string | undefined, userText: string): any[] {
+  const content: any[] = [];
+  if (pdfBase64) {
+    content.push({
+      type: "document",
+      source: { type: "base64", media_type: "application/pdf", data: pdfBase64 }
+    });
+  }
+  content.push({ type: "text", text: userText });
+  return content;
 }
 
 function sleep(ms: number) {
@@ -131,31 +149,43 @@ export async function callJsonWithDocument<T>(opts: {
     return block;
   });
 
-  const content: any[] = [];
-  if (opts.pdfBase64) {
-    content.push({
-      type: "document",
-      source: { type: "base64", media_type: "application/pdf", data: opts.pdfBase64 }
-    });
-  }
-  content.push({ type: "text", text: opts.userText });
+  // Fix 413 (05/06): sub-PDFs de seções escaneadas estouravam o limite de
+  // request da API (request_too_large). Comprime ANTES de montar o request.
+  let pdfBase64 = opts.pdfBase64
+    ? await fitPdfForClaude(opts.pdfBase64, { label: opts.operation ?? "unknown" })
+    : undefined;
 
   const started = Date.now();
   let attempts = 0;
   let res: any;
   let caughtErr: any;
-  try {
-    res = await callWithRetry(() => {
+  const doCall = () =>
+    callWithRetry(() => {
       attempts++;
       return client.messages.create({
         model: MODEL,
         max_tokens: opts.maxTokens ?? 4096,
         system,
-        messages: [{ role: "user", content }]
+        messages: [{ role: "user", content: buildUserContent(pdfBase64, opts.userText) }]
       });
     });
+  try {
+    res = await doCall();
   } catch (err) {
-    caughtErr = err;
+    if (isRequestTooLarge(err) && pdfBase64) {
+      // Retry reativo: rasterização agressiva e última tentativa.
+      try {
+        console.warn(
+          `[claude] 413 em ${opts.operation ?? "unknown"} — recomprimindo (scale-to 1000px) e retentando`
+        );
+        pdfBase64 = await rasterizePdfBase64(pdfBase64, { scaleTo: 1000, quality: 60 });
+        res = await doCall();
+      } catch (err2) {
+        caughtErr = err2;
+      }
+    } else {
+      caughtErr = err;
+    }
   }
 
   const event: UsageEvent = {
@@ -208,27 +238,23 @@ async function callToolWithDocument<T>(opts: {
     return block;
   });
 
-  const content: any[] = [];
-  if (opts.pdfBase64) {
-    content.push({
-      type: "document",
-      source: { type: "base64", media_type: "application/pdf", data: opts.pdfBase64 }
-    });
-  }
-  content.push({ type: "text", text: opts.userText });
+  // Fix 413 (05/06): comprime o PDF antes do request; ver callJsonWithDocument.
+  let pdfBase64 = opts.pdfBase64
+    ? await fitPdfForClaude(opts.pdfBase64, { label: opts.operation ?? "unknown" })
+    : undefined;
 
   const started = Date.now();
   let attempts = 0;
   let res: any;
   let caughtErr: any;
-  try {
-    res = await callWithRetry(() => {
+  const doCall = () =>
+    callWithRetry(() => {
       attempts++;
       return client.messages.create({
         model: MODEL,
         max_tokens: opts.maxTokens ?? 4096,
         system,
-        messages: [{ role: "user", content }],
+        messages: [{ role: "user", content: buildUserContent(pdfBase64, opts.userText) }],
         tools: [
           {
             name: opts.toolName,
@@ -239,8 +265,22 @@ async function callToolWithDocument<T>(opts: {
         tool_choice: { type: "tool", name: opts.toolName }
       });
     });
+  try {
+    res = await doCall();
   } catch (err) {
-    caughtErr = err;
+    if (isRequestTooLarge(err) && pdfBase64) {
+      try {
+        console.warn(
+          `[claude] 413 em ${opts.operation ?? "unknown"} — recomprimindo (scale-to 1000px) e retentando`
+        );
+        pdfBase64 = await rasterizePdfBase64(pdfBase64, { scaleTo: 1000, quality: 60 });
+        res = await doCall();
+      } catch (err2) {
+        caughtErr = err2;
+      }
+    } else {
+      caughtErr = err;
+    }
   }
 
   const event: UsageEvent = {

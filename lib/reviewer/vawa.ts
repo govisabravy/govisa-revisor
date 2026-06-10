@@ -1,6 +1,8 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { Finding } from "../schemas/forms";
 import type { VawaStoryFacts, I360Form } from "../schemas/vawa";
+import { stripJsonFences } from "./json-utils";
+import { fitPdfForClaude } from "./pdf-fit";
 import { parseDate } from "./rules";
 import { RULE_IDS } from "./rule_ids";
 
@@ -22,11 +24,6 @@ function client() {
   });
 }
 
-function stripJson(t: string) {
-  const m = t.match(/```(?:json)?\s*([\s\S]*?)```/);
-  return (m ? m[1] : t).trim();
-}
-
 async function callJsonWithPdf<T>(opts: {
   system: string;
   pdfBase64?: string;
@@ -38,7 +35,9 @@ async function callJsonWithPdf<T>(opts: {
     const c = client();
     const content: any[] = [];
     if (opts.pdfBase64) {
-      content.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: opts.pdfBase64 } });
+      // Fix 413 (05/06): garante que o PDF caiba no limite de request da API.
+      const fitted = await fitPdfForClaude(opts.pdfBase64, { label: opts.operation });
+      content.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: fitted } });
     }
     content.push({ type: "text", text: opts.userText });
     const res = await c.messages.create({
@@ -49,7 +48,7 @@ async function callJsonWithPdf<T>(opts: {
     });
     const textBlock = res.content.find((b: any) => b.type === "text") as any;
     if (!textBlock) return null;
-    return JSON.parse(stripJson(textBlock.text));
+    return JSON.parse(stripJsonFences(textBlock.text));
   } catch (err) {
     console.error(`[${opts.operation}]`, err);
     return null;
