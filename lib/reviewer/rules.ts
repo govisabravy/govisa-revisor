@@ -178,6 +178,51 @@ function namesPlausiblyEqual(a?: string | null, b?: string | null): boolean {
   return false;
 }
 
+/**
+ * Resolve o nome do titular de um documento (holder) para EXATAMENTE um sujeito,
+ * de forma conservadora — evita o bug de "confusão de pessoas" quando a família
+ * compartilha sobrenome (fix 19/06b). namesPlausiblyEqual casa por subconjunto,
+ * o que faz "John Smith" (dep) casar também com "John David Smith" (principal).
+ *
+ * Estratégia: prioriza IGUALDADE de conjunto de tokens (match forte); só cai pra
+ * subconjunto se houver um ÚNICO candidato. Em ambiguidade (0 ou >1), mantém o
+ * subject_id rotulado se for consistente, senão devolve null (não arrisca
+ * atribuir o documento à pessoa errada). Retorna o id resolvido ou null.
+ */
+export function resolveHolderSubject(
+  holder: string | null | undefined,
+  subjects: Array<{ id: string; display_name?: string | null }>,
+  labeledId?: string | null
+): string | null {
+  const tok = (name?: string | null) =>
+    new Set(norm(name).split(" ").filter(Boolean));
+  const eq = (a: Set<string>, b: Set<string>) =>
+    a.size > 0 && a.size === b.size && Array.from(a).every((t) => b.has(t));
+  const sub = (a: Set<string>, b: Set<string>) =>
+    a.size > 0 && Array.from(a).every((t) => b.has(t));
+
+  const h = tok(holder);
+  if (h.size === 0) return labeledId ?? null;
+  const cand = subjects.map((s) => ({ id: s.id, t: tok(s.display_name) }));
+
+  const exact = cand.filter((c) => eq(h, c.t));
+  if (exact.length === 1) return exact[0].id;
+  if (exact.length > 1)
+    return labeledId && exact.some((c) => c.id === labeledId) ? labeledId : null;
+
+  const loose = cand.filter((c) => c.t.size > 0 && (sub(h, c.t) || sub(c.t, h)));
+  if (loose.length === 1) return loose[0].id;
+  if (loose.length > 1)
+    return labeledId && loose.some((c) => c.id === labeledId) ? labeledId : null;
+
+  // Nenhum candidato: se o rótulo claramente NÃO bate com o holder, anula.
+  if (labeledId) {
+    const labeled = cand.find((c) => c.id === labeledId);
+    if (labeled && !(sub(h, labeled.t) || sub(labeled.t, h))) return null;
+  }
+  return labeledId ?? null;
+}
+
 function sameAddress(a: Address | undefined | null, ref = GOVISA_ADDRESS): boolean {
   if (!a) return false;
   return (
@@ -2278,14 +2323,21 @@ function applyLevel4Global(args: {
     // marido marcado como "child"), nenhuma regra determinística pegava. Estes
     // checks NÃO reclassificam — apenas sinalizam pra conferência manual.
     const SPOUSE_REL_RE = /spouse|cônjuge|conjuge|wife|husband|esposa|esposo|marido/;
-    const principalMarried = /\bmarried\b|\bcasad[ao]\b/.test(
-      norm(i914?.person?.marital_status ?? "").toLowerCase()
-    );
+    const maritalRaw = norm(i914?.person?.marital_status ?? "").toLowerCase();
+    // Casado de verdade — exclui negações ("not married", "unmarried", solteiro,
+    // divorciado, separado, viúvo). Fix 19/06b: /\bmarried\b/ casava "not married".
+    const principalMarried =
+      /\bmarried\b|\bcasad[ao]\b/.test(maritalRaw) &&
+      !/\b(not|never|nunca|n[ãa]o)\s+(married|casad)|unmarried|solteir|divorciad|separad|widow|vi[uú]v/.test(
+        maritalRaw
+      );
     const hasSpouseDep = i914a.some((a) =>
       SPOUSE_REL_RE.test((a.relationship_to_principal ?? "").toLowerCase())
     );
+    // Limites de palavra (fix 19/06b): /child|filh/ casava "stepchild"/"filhastro"
+    // (não-derivativos). \bchild\b e \bfilh[oa]s?\b excluem esses.
     const hasChildDep = i914a.some((a) =>
-      /child|filh/.test((a.relationship_to_principal ?? "").toLowerCase())
+      /\bchild\b|\bfilh[oa]s?\b/.test((a.relationship_to_principal ?? "").toLowerCase())
     );
     // Principal casado, há dependente "filho" mas NENHUM marcado como cônjuge:
     // o cônjuge pode ter sido marcado com outro parentesco por engano (o exato
@@ -2344,21 +2396,11 @@ function applyLevel4Global(args: {
     // sid é null): se bater com outro sujeito, corrige; se não bater com NENHUM
     // e contradisser o rótulo, anula (não arrisca um finding de passaporte
     // contra a pessoa errada).
+    // Resolução conservadora pelo nome do titular (fix 19/06b): evita reatribuir
+    // o documento a um parente que compartilha sobrenome (ver resolveHolderSubject).
     const holderName = (pc as any).holder_name as string | undefined;
     if (holderName) {
-      const matchedSubject = subjects.find((s) => {
-        const subjFull = `${s.given_name ?? ""} ${s.family_name ?? ""}`.trim();
-        return subjFull && namesPlausiblyEqual(holderName, subjFull);
-      });
-      if (matchedSubject) {
-        sid = matchedSubject.id;
-      } else if (sid) {
-        const labeled = subjects.find((s) => s.id === sid);
-        const labeledName = labeled
-          ? `${labeled.given_name ?? ""} ${labeled.family_name ?? ""}`.trim()
-          : "";
-        if (labeledName && !namesPlausiblyEqual(holderName, labeledName)) sid = null;
-      }
+      sid = resolveHolderSubject(holderName, subjects, sid);
     }
     if (check.has_passport_image && check.signed === false) {
       out.push({

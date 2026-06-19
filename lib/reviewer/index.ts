@@ -22,7 +22,7 @@ import {
   type PassportSignatureCheck,
   type StructureDocument
 } from "./claude";
-import { applyGovisaRules, summarize, assignSubjectANumbers } from "./rules";
+import { applyGovisaRules, summarize, assignSubjectANumbers, resolveHolderSubject } from "./rules";
 import { RULE_IDS } from "./rule_ids";
 import { extractI360FromText, extractVawaStoryFromText, applyVawaRules } from "./vawa";
 import {
@@ -247,7 +247,10 @@ function buildUSubjects(i918: I918Form | null, i918as: I918AForm[]): Subject[] {
       given_name: fm?.given_name ?? null,
       date_of_birth: fm?.date_of_birth ?? null,
       country_of_citizenship: fm?.country_of_citizenship ?? null,
-      relationship_to_principal: a.relationship_to_principal ?? null
+      relationship_to_principal: a.relationship_to_principal ?? null,
+      // Simetria com buildTSubjects (fix 19/06b): popular is_us_citizen p/ que
+      // dropI194 reconheça cônjuge/dependente USC também em U-visa.
+      is_us_citizen: (fm as any)?.is_us_citizen ?? null
     });
   });
   return subjects;
@@ -387,7 +390,6 @@ function subjectIsUSCitizen(s: Subject, i914: any): boolean {
   return false;
 }
 
-const SPOUSE_REL_RE = /spouse|c[ôo]njuge|esposa|esposo|marido|wife|husband/i;
 const I194_RE = /\bI-?\s?194\b/i;
 
 function dropI194FindingsForUSCitizens(
@@ -398,15 +400,6 @@ function dropI194FindingsForUSCitizens(
   const uscIds = new Set(
     subjects.filter((s) => subjectIsUSCitizen(s, i914)).map((s) => s.id)
   );
-  // Nomes dos cônjuges USC especificamente — usados para dispensar I-194 de um
-  // finding SEM subject_id que cite o nome DESSE cônjuge (não por menção
-  // genérica a "cônjuge").
-  const uscSpouseNames = subjects
-    .filter(
-      (s) => uscIds.has(s.id) && SPOUSE_REL_RE.test(s.relationship_to_principal ?? "")
-    )
-    .map((s) => s.display_name)
-    .filter(Boolean) as string[];
   if (uscIds.size === 0) return findings;
 
   return findings.filter((f) => {
@@ -414,16 +407,12 @@ function dropI194FindingsForUSCitizens(
       .filter(Boolean)
       .join(" | ");
     if (!I194_RE.test(text)) return true;
-    // (1) Finding de I-194 atribuído a um sujeito US citizen → dispensado.
+    // Só dispensa I-194 do PRÓPRIO sujeito US citizen, por subject_id. Fix 19/06b:
+    // a cláusula anterior por NOME sobre o texto livre do finding (sameNameLoose)
+    // apagava I-194 de dependente NÃO-USC quando um sobrenome comum (ex.: "Silva")
+    // aparecia no texto — falso negativo jurídico. Um I-194 de cônjuge USC sem
+    // subject_id que sobreviva é só um falso positivo benigno.
     if (f.subject_id && uscIds.has(f.subject_id)) return false;
-    // (2) Finding de I-194 SEM subject_id que cite o NOME de um cônjuge USC
-    // específico → dispensado. Fix 19/06 (auditoria, ponto 5): a cláusula
-    // anterior era GLOBAL — apagava I-194 de QUALQUER finding que mencionasse
-    // "cônjuge", inclusive de dependente NÃO-USC que legitimamente precisa do
-    // I-194 (falso negativo jurídico). Agora exige o nome do próprio cônjuge USC.
-    if (!f.subject_id && uscSpouseNames.some((n) => sameNameLoose(n, text))) {
-      return false;
-    }
     return true;
   });
 }
@@ -754,13 +743,10 @@ export async function reviewProcess(input: ReviewInput): Promise<ReviewOutput> {
   for (const pc of passportChecks) {
     const holder = pc.holder_name ?? (pc.check as any)?.holder_name_seen ?? null;
     if (!holder) continue;
-    const matched = subjects.find((s) => sameNameLoose(holder, s.display_name));
-    if (matched) {
-      pc.subject_id = matched.id;
-    } else if (pc.subject_id) {
-      const labeled = subjects.find((s) => s.id === pc.subject_id);
-      if (labeled && !sameNameLoose(holder, labeled.display_name)) pc.subject_id = null;
-    }
+    // Resolução conservadora (fix 19/06b): só reatribui em match único de nome;
+    // evita jogar o documento num parente que compartilha sobrenome (o match por
+    // subconjunto reintroduzia a própria "confusão de pessoas" que o fix resolvia).
+    pc.subject_id = resolveHolderSubject(holder, subjects, pc.subject_id);
   }
 
   // ---------------------------------------------------------------------------
