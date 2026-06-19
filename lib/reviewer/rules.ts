@@ -199,18 +199,53 @@ function sameAddress(a: Address | undefined | null, ref = GOVISA_ADDRESS): boole
  * residência, que costumam ter pequenas variações textuais ("Ste 200" vs
  * "Suite 200A", "32810" vs "32810-1234").
  */
+// Abreviações de logradouro/direção. Normaliza para a forma curta para que
+// "123 North Main Street" e "123 N Main St" comparem iguais. Fix 19/06
+// (auditoria caso Anderson): I-192 (por visão) vs I-765 com grafia diferente
+// do MESMO endereço disparava T_FILING_PHYSICAL_ADDR_DIVERGE_I192 (alta) espúria.
+const STREET_ABBREV: Array<[RegExp, string]> = [
+  [/\bSTREET\b/g, "ST"],
+  [/\bAVENUE\b/g, "AVE"],
+  [/\bROAD\b/g, "RD"],
+  [/\bDRIVE\b/g, "DR"],
+  [/\bBOULEVARD\b/g, "BLVD"],
+  [/\bLANE\b/g, "LN"],
+  [/\bCOURT\b/g, "CT"],
+  [/\bPLACE\b/g, "PL"],
+  [/\bTERRACE\b/g, "TER"],
+  [/\bHIGHWAY\b/g, "HWY"],
+  [/\bPARKWAY\b/g, "PKWY"],
+  [/\bCIRCLE\b/g, "CIR"],
+  [/\bNORTHEAST\b/g, "NE"],
+  [/\bNORTHWEST\b/g, "NW"],
+  [/\bSOUTHEAST\b/g, "SE"],
+  [/\bSOUTHWEST\b/g, "SW"],
+  [/\bNORTH\b/g, "N"],
+  [/\bSOUTH\b/g, "S"],
+  [/\bEAST\b/g, "E"],
+  [/\bWEST\b/g, "W"]
+];
+
+function normStreet(s?: string | null): string {
+  let v = norm(s)
+    .replace(/\b(STE|SUITE|APT|APARTMENT|UNIT|#)\b\.?/g, " ")
+    .replace(/[.,]/g, " ");
+  for (const [re, rep] of STREET_ABBREV) v = v.replace(re, rep);
+  return v.replace(/\s+/g, " ").trim();
+}
+
 function addressLooselyEqual(
   a: Address | undefined | null,
   b: Address | undefined | null
 ): boolean {
   if (!a || !b) return false;
-  const stripUnit = (s?: string | null) =>
-    norm(s)
-      .replace(/\b(STE|SUITE|APT|APARTMENT|UNIT|#)\b\.?/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
   const zip5 = (s?: string | null) => norm(s).replace(/\D/g, "").slice(0, 5);
-  if (stripUnit(a.street) !== stripUnit(b.street)) return false;
+  const sa = normStreet(a.street);
+  const sb = normStreet(b.street);
+  // Comparação simétrica: só reprova por rua se AMBOS os lados tiverem street
+  // e diferirem. Se um lado perdeu o street na extração (street=null/vazio),
+  // não dispara divergência só por isso — confia em city/state/zip. Fix 19/06.
+  if (sa && sb && sa !== sb) return false;
   if (norm(a.city) !== norm(b.city)) return false;
   if (norm(a.state) !== norm(b.state)) return false;
   const za = zip5(a.zip);
@@ -912,10 +947,65 @@ function collectPrincipalANumbers(
       if (pa && typeof pa === "object") {
         const c = canonANumber(pa.a_number);
         if (c) set.add(c);
+        // Fix 19/06 (auditoria): Part 1 também pode trazer a_numbers_seen.
+        const paSeen: Array<{ value?: string }> = Array.isArray(pa.a_numbers_seen)
+          ? pa.a_numbers_seen
+          : [];
+        for (const s of paSeen) {
+          const cc = canonANumber(s?.value);
+          if (cc) set.add(cc);
+        }
       }
     }
   }
   return set;
+}
+
+/**
+ * A-Numbers que aparecem em DOIS OU MAIS dependentes distintos. Como cada
+ * pessoa tem um A-Number único, um número compartilhado entre dependentes é
+ * quase certamente vazamento do cabeçalho do Supplement A (o A# do principal
+ * repetido em "Additional Information"), não o A# real de cada um.
+ *
+ * Defesa-em-profundidade (fix 19/06 — auditoria caso Anderson): quando a
+ * VÍTIMA T-visa não tem A-Number próprio extraído, collectPrincipalANumbers
+ * fica vazio e o filtro de vazamento não rodava, deixando o A# vazado disparar
+ * um falso "A-Number divergente" CRÍTICO e imune ao adversarial. Esta heurística
+ * recupera o número vazado mesmo sem o A# do principal.
+ */
+function collectSharedDependentANumbers(
+  subjects: Subject[],
+  clusters: Map<string, FormData[]>
+): Set<string> {
+  const perDepCanons: Set<string>[] = [];
+  for (const subject of subjects) {
+    if (subject.role !== "dependent") continue;
+    const forms = clusters.get(subject.id) ?? [];
+    const canons = new Set<string>();
+    for (const f of forms) {
+      const person = (f as any).person ?? (f as any).family_member;
+      if (!person || typeof person !== "object") continue;
+      const seen: Array<{ value?: string }> = Array.isArray(person.a_numbers_seen)
+        ? person.a_numbers_seen
+        : [];
+      const values = seen.map((s) => s?.value).filter(Boolean) as string[];
+      if (values.length === 0 && person.a_number) values.push(String(person.a_number));
+      for (const v of values) {
+        const c = canonANumber(v);
+        if (c && !ATTORNEY_USCIS_NUMBERS.has(c)) canons.add(c);
+      }
+    }
+    perDepCanons.push(canons);
+  }
+  const freq = new Map<string, number>();
+  for (const canons of perDepCanons) {
+    for (const c of Array.from(canons)) freq.set(c, (freq.get(c) ?? 0) + 1);
+  }
+  const shared = new Set<string>();
+  for (const [c, n] of Array.from(freq.entries())) {
+    if (n >= 2) shared.add(c);
+  }
+  return shared;
 }
 
 function applyANumberConsistency(
@@ -924,6 +1014,12 @@ function applyANumberConsistency(
 ): Finding[] {
   const out: Finding[] = [];
   const principalCanons = collectPrincipalANumbers(subjects, clusters);
+  // Vazamento = A# do principal OU A# compartilhado entre 2+ dependentes
+  // (fix 19/06: cobre o caso da vítima sem A# próprio extraído).
+  const leakCanons = new Set<string>(Array.from(principalCanons));
+  for (const c of Array.from(collectSharedDependentANumbers(subjects, clusters))) {
+    leakCanons.add(c);
+  }
 
   for (const subject of subjects) {
     const forms = clusters.get(subject.id) ?? [];
@@ -968,10 +1064,10 @@ function applyANumberConsistency(
     // A-Number do PRINCIPAL são vazamento do cabeçalho/Part 1 do Supplement A
     // (Additional Information repete o A# do principal) — pertencem ao
     // principal, não ao dependente. Removê-las antes de avaliar divergência.
-    if (subject.role === "dependent" && principalCanons.size > 0) {
-      const own = filtered.filter((o) => !principalCanons.has(o.canon));
+    if (subject.role === "dependent" && leakCanons.size > 0) {
+      const own = filtered.filter((o) => !leakCanons.has(o.canon));
       // Só filtra se sobrar pelo menos uma ocorrência própria do dependente —
-      // se TODAS baterem com o principal, mantém (pode ser erro real de
+      // se TODAS baterem com o vazamento, mantém (pode ser erro real de
       // preenchimento usando o A# do principal pro dependente).
       if (own.length > 0 && own.length < filtered.length) {
         filtered = own;
@@ -1098,6 +1194,11 @@ function applyANumberConsistency(
 export function assignSubjectANumbers(subjects: Subject[], forms: FormData[]): void {
   const clusters = clusterFormsBySubject(forms, subjects);
   const principalCanons = collectPrincipalANumbers(subjects, clusters);
+  // Vazamento = A# do principal OU A# compartilhado entre 2+ deps (fix 19/06).
+  const leakCanons = new Set<string>(Array.from(principalCanons));
+  for (const c of Array.from(collectSharedDependentANumbers(subjects, clusters))) {
+    leakCanons.add(c);
+  }
 
   for (const subject of subjects) {
     if (subject.a_number) continue;
@@ -1114,7 +1215,7 @@ export function assignSubjectANumbers(subjects: Subject[], forms: FormData[]): v
       for (const v of values) {
         const c = canonANumber(v);
         if (!c || ATTORNEY_USCIS_NUMBERS.has(c)) continue;
-        if (subject.role === "dependent" && principalCanons.has(c)) continue;
+        if (subject.role === "dependent" && leakCanons.has(c)) continue;
         const cur = counts.get(c);
         if (cur) cur.count++;
         else counts.set(c, { count: 1, raw: String(v) });
@@ -2171,6 +2272,60 @@ function applyLevel4Global(args: {
         });
       }
     }
+
+    // Cross-check de associação (fix 19/06 — auditoria caso Anderson, ponto 3).
+    // O relationship vem só do checkbox (visão); se a visão ler errado (ex.:
+    // marido marcado como "child"), nenhuma regra determinística pegava. Estes
+    // checks NÃO reclassificam — apenas sinalizam pra conferência manual.
+    const SPOUSE_REL_RE = /spouse|cônjuge|conjuge|wife|husband|esposa|esposo|marido/;
+    const principalMarried = /\bmarried\b|\bcasad[ao]\b/.test(
+      norm(i914?.person?.marital_status ?? "").toLowerCase()
+    );
+    const hasSpouseDep = i914a.some((a) =>
+      SPOUSE_REL_RE.test((a.relationship_to_principal ?? "").toLowerCase())
+    );
+    const hasChildDep = i914a.some((a) =>
+      /child|filh/.test((a.relationship_to_principal ?? "").toLowerCase())
+    );
+    // Principal casado, há dependente "filho" mas NENHUM marcado como cônjuge:
+    // o cônjuge pode ter sido marcado com outro parentesco por engano (o exato
+    // bug "marido marcado como filho" reportado pelo cliente).
+    if (principalMarried && hasChildDep && !hasSpouseDep) {
+      out.push({
+        severity: "media",
+        tier: "tier2_substantivo",
+        category: "elegibilidade",
+        field: "I-914A — Associação do cônjuge",
+        form: "I-914A",
+        explanation:
+          "O principal consta como casado(a) no I-914, mas nenhum dependente está marcado como cônjuge (Spouse) nos I-914A — apenas filho(s). Conferir se o cônjuge foi marcado com outro parentesco por engano (ex.: marido marcado como filho).",
+        recommendation:
+          "Conferir manualmente o checkbox de relação dos I-914A: o cônjuge deve estar marcado como Spouse.",
+        rule_id: RULE_IDS.T_DEP_MARITAL_STATUS_NO_SPOUSE_DEP,
+        subject_id: principalSubject?.id ?? null
+      });
+    }
+    // Dependente sem relação legível (checkbox não lido): a relação determina a
+    // elegibilidade derivativa — sinalizar pra conferência (port da regra de
+    // U-visa U_DEP_I918A_NO_QUALIFYING_REL pro T-visa).
+    for (const a of i914a) {
+      const rel = (a.relationship_to_principal ?? "").trim();
+      if (!rel) {
+        out.push({
+          severity: "media",
+          tier: "tier2_substantivo",
+          category: "elegibilidade",
+          field: "I-914A — Relação não identificada",
+          form: "I-914A",
+          explanation:
+            "Não foi possível identificar o parentesco (checkbox de relação) deste dependente no I-914A. A relação determina a elegibilidade derivativa.",
+          recommendation:
+            "Conferir manualmente qual caixa de relação está marcada (Spouse / Child / Parent / Sibling) no I-914A.",
+          rule_id: RULE_IDS.T_DEP_I914A_REL_MISSING,
+          subject_id: getSubjectId(a) ?? null
+        });
+      }
+    }
   }
 
   // ---- Passport checks (loop) — Ajuste 23.1: critica em qualquer modo ----
@@ -2181,13 +2336,29 @@ function applyLevel4Global(args: {
   for (const pc of passportChecks) {
     const check = pc.check;
     let sid = pc.subject_id ?? null;
-    if (!sid && (pc as any).holder_name) {
-      const holderName = (pc as any).holder_name as string;
+    // Fix 19/06 (auditoria — "confundindo as pessoas"): o mapeador rotula os
+    // subdocs de identificação por ORDEM (dep_1, dep_2…), então o subject_id
+    // pode apontar para a pessoa ERRADA (caso Anderson real: a certidão do
+    // Dominick/dep_3 foi rotulada como dep_1/Adecleia). O holder_name lido do
+    // PRÓPRIO documento é a fonte da verdade — revalida SEMPRE (não só quando
+    // sid é null): se bater com outro sujeito, corrige; se não bater com NENHUM
+    // e contradisser o rótulo, anula (não arrisca um finding de passaporte
+    // contra a pessoa errada).
+    const holderName = (pc as any).holder_name as string | undefined;
+    if (holderName) {
       const matchedSubject = subjects.find((s) => {
         const subjFull = `${s.given_name ?? ""} ${s.family_name ?? ""}`.trim();
         return subjFull && namesPlausiblyEqual(holderName, subjFull);
       });
-      if (matchedSubject) sid = matchedSubject.id;
+      if (matchedSubject) {
+        sid = matchedSubject.id;
+      } else if (sid) {
+        const labeled = subjects.find((s) => s.id === sid);
+        const labeledName = labeled
+          ? `${labeled.given_name ?? ""} ${labeled.family_name ?? ""}`.trim()
+          : "";
+        if (labeledName && !namesPlausiblyEqual(holderName, labeledName)) sid = null;
+      }
     }
     if (check.has_passport_image && check.signed === false) {
       out.push({
@@ -2918,11 +3089,20 @@ function applyLevel4Global(args: {
       // inglês — não precisam de certified translation (8 CFR 103.2(b)(3)
       // só alcança documentos em língua estrangeira). Ex: Florida Marriage
       // Record, US birth certificate, county clerk records.
+      // Fix 19/06 (auditoria, ponto 6): exigir CONTEXTO DE EMISSÃO americana —
+      // "florida" solto (ex.: endereço de residência na Flórida num doc
+      // estrangeiro) NÃO dispensa tradução. 8 CFR 103.2(b)(3): a porção em
+      // língua estrangeira sempre exige certified translation.
       const looksUSIssued =
-        /issued in the (u\.?s\.?a?|united states)|emitid[ao]s? (nos|em) (eua|estados unidos)|county (clerk|record)|clerk of (the )?(circuit )?court|\bflorida\b|\bflórida\b|state of [a-z]+.{0,12}(usa|u\.s)|us (marriage|birth)|american (marriage|birth)/i.test(
+        /issued in the (u\.?s\.?a?|united states)|emitid[ao]s? (nos|em) (eua|estados unidos)|county (clerk|record)|clerk of (the )?(circuit )?court|(issued|emitid[ao]s?).{0,20}(florida|fl[oó]rida)|(florida|fl[oó]rida) (clerk|department of health|marriage|birth|vital|record)|state of [a-z]+.{0,12}(usa|u\.s)|us (marriage|birth)|american (marriage|birth)/i.test(
           s
         );
-      const looksEnglish = /already in english|in english|em ingl[eê]s|língua inglesa|lingua inglesa/.test(s);
+      // "in english" solto era frágil (doc bilíngue/parcial). Exigir que o doc
+      // esteja INTEGRALMENTE em inglês.
+      const looksEnglish =
+        /already in english|entirely in english|fully in english|wholly in english|todo em ingl[eê]s|integralmente em ingl[eê]s/.test(
+          s
+        );
       if (looksUSIssued || looksEnglish) return false;
       return true;
     });

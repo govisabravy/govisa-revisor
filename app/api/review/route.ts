@@ -95,6 +95,12 @@ export async function POST(req: NextRequest) {
     }
     const costUsd = estimateCostUSD(model, usageTotals);
 
+    // Fix 19/06 (auditoria, ponto 1): re-checar cancelamento imediatamente antes
+    // de persistir. Havia uma race entre o check da linha 65 e o saveReview — se
+    // o POST /cancel chegava durante o uploadReviewPdf (await de rede ao S3), o
+    // abort era ignorado e a review cancelada ERA salva no histórico/KPIs.
+    if (cancelCtrl.signal.aborted) throw new ReviewCancelledError();
+
     saveReview({
       id: reviewId,
       created_at: startedAt,

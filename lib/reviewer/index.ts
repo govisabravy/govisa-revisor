@@ -211,7 +211,11 @@ function buildTSubjects(formsT: FormData[]): Subject[] {
       given_name: fm?.given_name ?? null,
       date_of_birth: fm?.date_of_birth ?? null,
       country_of_citizenship: fm?.country_of_citizenship ?? null,
-      relationship_to_principal: a.relationship_to_principal ?? null
+      relationship_to_principal: a.relationship_to_principal ?? null,
+      // Fix 19/06 (auditoria, ponto 5): popular is_us_citizen a partir do
+      // family_member do I-914A, para que subjectIsUSCitizen reconheça o
+      // cônjuge/filho americano e dispense o I-194 corretamente.
+      is_us_citizen: (fm as any)?.is_us_citizen ?? null
     });
   });
 
@@ -394,26 +398,32 @@ function dropI194FindingsForUSCitizens(
   const uscIds = new Set(
     subjects.filter((s) => subjectIsUSCitizen(s, i914)).map((s) => s.id)
   );
-  const spouseIsUsc =
-    subjects.some(
-      (s) => SPOUSE_REL_RE.test(s.relationship_to_principal ?? "") && uscIds.has(s.id)
-    ) ||
-    (Array.isArray(i914?.family_members_included) &&
-      i914.family_members_included.some(
-        (fm: any) =>
-          fm?.is_us_citizen === true && SPOUSE_REL_RE.test(String(fm?.relationship ?? ""))
-      ));
-  if (uscIds.size === 0 && !spouseIsUsc) return findings;
+  // Nomes dos cônjuges USC especificamente — usados para dispensar I-194 de um
+  // finding SEM subject_id que cite o nome DESSE cônjuge (não por menção
+  // genérica a "cônjuge").
+  const uscSpouseNames = subjects
+    .filter(
+      (s) => uscIds.has(s.id) && SPOUSE_REL_RE.test(s.relationship_to_principal ?? "")
+    )
+    .map((s) => s.display_name)
+    .filter(Boolean) as string[];
+  if (uscIds.size === 0) return findings;
 
   return findings.filter((f) => {
     const text = [f.field, f.form, f.expected, f.found, f.explanation, f.recommendation]
       .filter(Boolean)
       .join(" | ");
     if (!I194_RE.test(text)) return true;
-    // Finding sobre I-194 atribuído a um sujeito US citizen → dispensado.
+    // (1) Finding de I-194 atribuído a um sujeito US citizen → dispensado.
     if (f.subject_id && uscIds.has(f.subject_id)) return false;
-    // Finding sobre I-194 mencionando cônjuge quando o cônjuge é US citizen.
-    if (spouseIsUsc && SPOUSE_REL_RE.test(text)) return false;
+    // (2) Finding de I-194 SEM subject_id que cite o NOME de um cônjuge USC
+    // específico → dispensado. Fix 19/06 (auditoria, ponto 5): a cláusula
+    // anterior era GLOBAL — apagava I-194 de QUALQUER finding que mencionasse
+    // "cônjuge", inclusive de dependente NÃO-USC que legitimamente precisa do
+    // I-194 (falso negativo jurídico). Agora exige o nome do próprio cônjuge USC.
+    if (!f.subject_id && uscSpouseNames.some((n) => sameNameLoose(n, text))) {
+      return false;
+    }
     return true;
   });
 }
@@ -731,6 +741,29 @@ export async function reviewProcess(input: ReviewInput): Promise<ReviewOutput> {
   else subjects = buildVawaSubjects(i360);
 
   // ---------------------------------------------------------------------------
+  // Reconciliação de pessoa nos passport checks (fix 19/06 — auditoria
+  // "confundindo as pessoas"). O mapeador (LLM, roda ANTES da extração, sem os
+  // subjects estruturados) às vezes atribui ao subdoc de identificação um
+  // subject_id INCONSISTENTE com o holder_name do próprio documento (caso
+  // Anderson real: a certidão do Dominick/dep_3 foi rotulada como dep_1/
+  // Adecleia). Agora que os subjects existem, o nome do titular lido no
+  // documento é a fonte da verdade: corrige o subject_id para o sujeito que
+  // bate; se não bater com NENHUM e contradisser o rótulo, anula (evita que
+  // qualquer consumidor — passport findings, evidência de relação — atribua o
+  // documento à pessoa errada).
+  for (const pc of passportChecks) {
+    const holder = pc.holder_name ?? (pc.check as any)?.holder_name_seen ?? null;
+    if (!holder) continue;
+    const matched = subjects.find((s) => sameNameLoose(holder, s.display_name));
+    if (matched) {
+      pc.subject_id = matched.id;
+    } else if (pc.subject_id) {
+      const labeled = subjects.find((s) => s.id === pc.subject_id);
+      if (labeled && !sameNameLoose(holder, labeled.display_name)) pc.subject_id = null;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Proof of address (rodada APÓS extrações pra ter expected_holder_names)
   // ---------------------------------------------------------------------------
   throwIfAborted(input.signal);
@@ -938,6 +971,12 @@ export async function reviewProcess(input: ReviewInput): Promise<ReviewOutput> {
       if (rid.startsWith("T_SUBST_I192_")) return false;
       if (rid.startsWith("T_SUBST_COOPERATION_")) return false;
       if (rid.startsWith("T_DEP_")) return false;
+      // Divergência de A-Number é universal (vale para U-visa e VAWA também) —
+      // NÃO dropar. Fix 19/06 (auditoria, ponto 4/cross): o nonTSpecific
+      // suprimia divergência REAL de A# entre I-918/I-918A (falso negativo
+      // grave → RFE/NOID). O resto das regras T_CONS_ continua filtrado.
+      if (rid === "T_CONS_ANUMBER_DIVERGE" || rid === "T_CONS_ANUMBER_SSN_EXTRACTOR_SWAP")
+        return true;
       if (rid.startsWith("T_CONS_")) return false;
       return true;
     });
@@ -1123,6 +1162,22 @@ export async function reviewProcess(input: ReviewInput): Promise<ReviewOutput> {
   }
 
   // ---------------------------------------------------------------------------
+  // Item 5 (10/06): familiares CIDADÃOS AMERICANOS não precisam de I-194.
+  // Roda ANTES do RFE (fix 19/06 — auditoria): assim a predição de RFE não
+  // ingere o finding de I-194 do cônjuge USC que será removido, evitando uma
+  // "RFE-fantasma" sobrevivente em rfe_predictions.
+  // ---------------------------------------------------------------------------
+  try {
+    const i914ForUsc = formsT.find((f) => f.form === "I-914") as any;
+    findings = dropI194FindingsForUSCitizens(findings, subjects, i914ForUsc ?? null);
+  } catch (err) {
+    console.error(
+      "dropI194FindingsForUSCitizens falhou (degradando):",
+      String((err as any)?.message ?? err).slice(0, 150)
+    );
+  }
+
+  // ---------------------------------------------------------------------------
   // FASE 6 — RFE Prediction (camada determinística + refine LLM opcional)
   // ---------------------------------------------------------------------------
   throwIfAborted(input.signal);
@@ -1157,23 +1212,6 @@ export async function reviewProcess(input: ReviewInput): Promise<ReviewOutput> {
       String((err as any)?.message ?? err).slice(0, 200)
     );
     rfePredictions = [];
-  }
-
-  // ---------------------------------------------------------------------------
-  // Item 5 (10/06): familiares CIDADÃOS AMERICANOS não precisam de forms
-  // derivativos (I-194, I-192, I-914A, I-765 derivativo). Se o cônjuge (ou
-  // outro familiar) é US citizen — verificável pela certidão de casamento
-  // americana / I-914 family_members_included / cluster validator — findings
-  // exigindo I-194 (ou docs derivativos) pra essa pessoa são removidos.
-  // ---------------------------------------------------------------------------
-  try {
-    const i914ForUsc = formsT.find((f) => f.form === "I-914") as any;
-    findings = dropI194FindingsForUSCitizens(findings, subjects, i914ForUsc ?? null);
-  } catch (err) {
-    console.error(
-      "dropI194FindingsForUSCitizens falhou (degradando):",
-      String((err as any)?.message ?? err).slice(0, 150)
-    );
   }
 
   // ---------------------------------------------------------------------------
