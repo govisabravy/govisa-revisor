@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import ReviewReportView from "@/components/ReviewReport";
-import { ArrowLeft, Clock, DollarSign, Hash, RefreshCw } from "lucide-react";
+import { ArrowLeft, Clock, DollarSign, Hash, RefreshCw, FileDown } from "lucide-react";
 
 export default function HistoricoDetailPage() {
   const params = useParams<{ id: string }>();
@@ -86,6 +86,14 @@ export default function HistoricoDetailPage() {
                 Rerodar revisão
               </button>
             ) : null}
+            <a
+              href={`/api/reviews/${params.id}/pdf`}
+              download
+              className="flex items-center gap-2 px-4 py-2 bg-white border border-slate-200 rounded-lg text-sm hover:bg-slate-50"
+            >
+              <FileDown className="w-4 h-4" />
+              Baixar PDF
+            </a>
             <Link
               href="/app/historico"
               className="flex items-center gap-2 px-4 py-2 bg-white border border-slate-200 rounded-lg text-sm hover:bg-slate-50"

@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import ReviewReportView from "@/components/ReviewReport";
-import { ArrowLeft, Clock, DollarSign, Hash, User } from "lucide-react";
+import { ArrowLeft, Clock, DollarSign, Hash, User, FileDown } from "lucide-react";
 
 export default function AdminRevisaoDetail() {
   const params = useParams<{ id: string }>();
@@ -45,9 +45,18 @@ export default function AdminRevisaoDetail() {
             <h1 className="text-2xl font-bold text-slate-900">{meta.client_name ?? meta.file_name}</h1>
             <div className="text-sm text-slate-500 mt-1 flex items-center gap-2"><User className="w-3 h-3" /> {userInfo?.email ?? "—"}</div>
           </div>
-          <Link href="/admin/revisoes" className="flex items-center gap-2 bg-white border border-slate-200 rounded-lg px-4 py-2 text-sm hover:bg-slate-50">
-            <ArrowLeft className="w-4 h-4" /> Voltar
-          </Link>
+          <div className="flex items-center gap-2">
+            <a
+              href={`/api/reviews/${params.id}/pdf`}
+              download
+              className="flex items-center gap-2 bg-white border border-slate-200 rounded-lg px-4 py-2 text-sm hover:bg-slate-50"
+            >
+              <FileDown className="w-4 h-4" /> Baixar PDF
+            </a>
+            <Link href="/admin/revisoes" className="flex items-center gap-2 bg-white border border-slate-200 rounded-lg px-4 py-2 text-sm hover:bg-slate-50">
+              <ArrowLeft className="w-4 h-4" /> Voltar
+            </Link>
+          </div>
         </div>
 
         <div className="bg-white rounded-2xl p-5 border border-slate-200">
