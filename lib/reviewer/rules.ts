@@ -21,14 +21,17 @@ import { RULE_IDS } from "./rule_ids";
 // Constantes e helpers
 // ---------------------------------------------------------------------------
 
+// Mudança de sede 07/2026: endereço anterior era 429 South Keller Road,
+// Ste 200A, Orlando, FL 32810. Filings com o endereço antigo passam a ser
+// apontados (decisão do cliente — casos pendentes devem ser corrigidos).
 export const GOVISA_ADDRESS = {
   in_care_of: "GO VISA LAW FIRM",
-  street: "429 SOUTH KELLER ROAD",
+  street: "222 S WESTMONTE DR",
   apt_ste_flr: "Ste" as const,
-  apt_number: "200A",
-  city: "ORLANDO",
+  apt_number: "215",
+  city: "ALTAMONTE SPRINGS",
   state: "FL",
-  zip: "32810"
+  zip: "32714"
 };
 
 /**
@@ -242,7 +245,7 @@ function sameAddress(a: Address | undefined | null, ref = GOVISA_ADDRESS): boole
  *
  * Usado pra cruzar Physical Address de form com endereço de comprovante de
  * residência, que costumam ter pequenas variações textuais ("Ste 200" vs
- * "Suite 200A", "32810" vs "32810-1234").
+ * "Suite 215", "32714" vs "32714-1234").
  */
 // Abreviações de logradouro/direção. Normaliza para a forma curta para que
 // "123 North Main Street" e "123 N Main St" comparem iguais. Fix 19/06

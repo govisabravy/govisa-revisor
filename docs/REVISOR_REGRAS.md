@@ -34,7 +34,7 @@ Este documento lista **todas as verificações** que o sistema faz em um process
 
 ### 1.1 Physical Address tem que ser o da Go Visa
 - **Severidade:** Crítica
-- **O que checa:** Se o "Physical Address" do formulário é o endereço da Go Visa (429 S Keller Rd, Ste 200A, Orlando, FL 32810).
+- **O que checa:** Se o "Physical Address" do formulário é o endereço da Go Visa (222 S Westmonte Dr, Suite 215, Altamonte Springs, FL 32714 — sede nova desde 07/2026; o endereço antigo de Orlando não é mais aceito).
 - **Dispara quando:** O endereço no formulário não é o da Go Visa.
 - **Comentário do cliente:**
 
